@@ -1,4 +1,4 @@
-name: OpenIDEA Dev Containers Docker compatibility release
+name: OpenIDEA Dev Containers hotfix release
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ concurrency:
 env:
   UPSTREAM: l0ng-ai/openidea
   PATCH_BRANCH: codex/builtin-devcontainers
-  PATCH_COMMIT: 5a2276351fe31ff8c76e1bbcc9f351d57ffd0433
+  PATCH_COMMIT: 97bfcae09a64b621eae34a790cdbfda0975ba862
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
@@ -33,14 +33,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Prepare the Docker compatibility release
+      - name: Prepare the Dev Containers update
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           upstream_tag=v0.1.42
-          version=0.1.43-devcontainers.1
+          version=0.1.43-devcontainers.2
           release_tag="devcontainers-v$version"
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.draft | not) | .tag_name')
@@ -303,7 +303,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --title "OpenIDEA Dev Containers $VERSION" \
-              --notes "Based on $UPSTREAM $UPSTREAM_TAG. Fixes SSH container connections with legacy Docker, including Docker 18.09.0."
+              --notes "Based on $UPSTREAM $UPSTREAM_TAG. Speeds up folder browsing in SSH containers and includes the Docker 18.09.0 compatibility fix."
           fi
           gh release upload "$RELEASE_TAG" "$artifacts/"* --clobber
           gh release edit "$RELEASE_TAG" --draft=false --latest
