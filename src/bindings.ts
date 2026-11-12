@@ -1552,6 +1552,8 @@ export const commands = {
 	os: string,
 	commands: string[],
 } | null>("remote_current"),
+	/**  Whether agents in this remote window use the desktop's network. Pass a value to change it. */
+	remoteAgentNetwork: (enabled: boolean | null) => typedError<boolean, IdeError>(__TAURI_INVOKE("remote_agent_network", { enabled })),
 	remoteDisconnect: () => __TAURI_INVOKE<void>("remote_disconnect"),
 	/**  The remote ports this window forwards to this machine. */
 	remoteForwardedPorts: () => __TAURI_INVOKE<ForwardedPort[]>("remote_forwarded_ports"),

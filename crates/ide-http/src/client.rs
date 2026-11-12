@@ -31,15 +31,7 @@ pub fn build(proxy: &ProxySettings) -> IdeResult<reqwest::Client> {
 
 /// A client with an explicit redirect policy, for callers enforcing network grants.
 pub fn build_with_redirect(proxy: &ProxySettings, redirect: reqwest::redirect::Policy) -> IdeResult<reqwest::Client> {
-    use rustls_platform_verifier::BuilderVerifierExt;
     let fail = |e: String| IdeError::internal(format!("HTTP client: {e}"));
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| fail(e.to_string()))?
-        .with_platform_verifier()
-        .map_err(|e| fail(e.to_string()))?
-        .with_no_client_auth();
     // `localhost` is tried on IPv4 first: local servers (Ollama, dev servers)
     // usually listen there, and on Windows a refused `::1` costs ~2 s before
     // the system resolver's order falls back. Ports come from the URL.
@@ -48,12 +40,25 @@ pub fn build_with_redirect(proxy: &ProxySettings, redirect: reqwest::redirect::P
         std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
     ];
     let builder = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls)
+        .tls_backend_preconfigured(tls_config()?)
         .redirect(redirect)
         .resolve_to_addrs("localhost", &loopback)
         .connect_timeout(Duration::from_secs(30))
         .user_agent(concat!("OpenIDEA-HttpClient/", env!("CARGO_PKG_VERSION")));
     with_proxy(builder, proxy).build().map_err(|e| fail(e.to_string()))
+}
+
+/// TLS using the platform's certificate store.
+pub fn tls_config() -> IdeResult<rustls::ClientConfig> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let fail = |e: rustls::Error| IdeError::internal(format!("HTTP client: {e}"));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(fail)?
+        .with_platform_verifier()
+        .map_err(fail)?
+        .with_no_client_auth())
 }
 
 /// The client for the current proxy settings, rebuilt when they change.

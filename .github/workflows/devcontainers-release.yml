@@ -187,7 +187,7 @@ jobs:
           path: src/bindings.ts
           if-no-files-found: error
       - name: Verify remote development
-        run: pnpm vitest run src/features/remote-dev src/features/welcome src/platform/remote.test.ts src/platform/locales/textCatalog.test.ts
+        run: pnpm vitest run src/features/remote-dev src/features/tools src/features/agents/agentRegistry.test.tsx src/features/welcome src/platform/remote.test.ts src/platform/locales/textCatalog.test.ts
       - name: Build and sign the Windows installer
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.DEVCONTAINERS_TAURI_PRIVATE_KEY }}
@@ -263,6 +263,7 @@ jobs:
           cargo build --release --locked -p ide-host --bin openidea-server --target "$TARGET"
           if [ "$ARCH" = x86_64 ]; then
             cargo test --release --locked -p ide-remote --lib --target "$TARGET"
+            cargo test --release --locked -p ide-host --lib --target "$TARGET" agent_network::
           fi
           server="target/$TARGET/release/openidea-server"
           "$server" --version | grep -F "openidea-server $VERSION"

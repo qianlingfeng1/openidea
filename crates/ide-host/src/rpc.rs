@@ -277,12 +277,26 @@ impl Dispatcher {
 
 /// Serves `host` over `reader` / `writer` until the client disconnects.
 /// `peer` must be the one whose events `host` sends ([`event_sink`]).
-pub async fn serve<R, W>(host: Arc<Host>, dispatcher: Dispatcher, peer: Arc<OnceLock<Peer>>, reader: R, writer: W)
+pub async fn serve<R, W>(host: Arc<Host>, mut dispatcher: Dispatcher, peer: Arc<OnceLock<Peer>>, reader: R, writer: W)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let handler = Arc::new(ServerHandler { host: host.clone(), dispatcher, peer: peer.clone() });
+    let network = Arc::new(crate::agent_network::Server::default());
+    let configure = network.clone();
+    dispatcher.add(crate::agent_network::CONFIGURE, move |c| {
+        let configure = configure.clone();
+        async move {
+            let token: Option<String> = c.arg("token")?;
+            if token.is_some() {
+                c.host.require_trust(&c.window)?;
+            }
+            let project = c.host.project(&c.window)?;
+            let peer = c.peer.get().ok_or_else(|| IdeError::unavailable("The remote connection is closed"))?;
+            configure.configure(&project, peer.clone(), token).await
+        }
+    });
+    let handler = Arc::new(ServerHandler { host: host.clone(), dispatcher, peer: peer.clone(), network });
     let p = Peer::connect(reader, writer, handler);
     let _ = peer.set(p.clone());
     p.closed().await;
@@ -314,6 +328,7 @@ struct ServerHandler {
     host: Arc<Host>,
     dispatcher: Dispatcher,
     peer: Arc<OnceLock<Peer>>,
+    network: Arc<crate::agent_network::Server>,
 }
 
 pub fn server_info() -> ServerInfo {
@@ -327,7 +342,9 @@ pub fn server_info() -> ServerInfo {
 }
 
 impl Handler for ServerHandler {
-    fn on_notification(&self, _method: &str, _params: Value) {}
+    fn on_notification(&self, method: &str, params: Value) {
+        self.network.on_notification(method, params);
+    }
 
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         let internal = |e: serde_json::Error| (codes::INTERNAL_ERROR, e.to_string());

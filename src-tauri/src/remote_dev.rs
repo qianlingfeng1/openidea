@@ -6,6 +6,7 @@
 use crate::events::TauriSink;
 use crate::state::AppState;
 use ide_core::{CancellationToken, EventSink, IdeError, IdeResult, RequestId};
+use ide_host::agent_network::{self, Desktop};
 use ide_host::rpc::{ChannelMessage, EventMessage, Invoke, ServerInfo};
 use ide_jsonrpc::{Handler, NoopHandler, Peer};
 use ide_remote::ssh_container::{ContainerBrowser, ContainerFolders, DockerOverSsh, SshContainers};
@@ -172,6 +173,8 @@ pub struct Connection {
     /// Remote ports forwarded to this machine (Ports tool window), by host (`None`: the remote
     /// host itself) and remote port.
     forwards: Mutex<Vec<(ForwardKey, Forward)>>,
+    agent_network: Arc<Desktop>,
+    agent_network_change: tokio::sync::Mutex<()>,
 }
 
 /// A forwarded port's host (`None`: the remote host itself) and remote port.
@@ -269,6 +272,7 @@ impl Connections {
         self.container_browsers.lock().remove(window);
         if let Some(c) = self.projects.lock().remove(window) {
             c.peer.kill();
+            c.agent_network.disable();
             c.forwards.lock().clear();
         }
     }
@@ -323,10 +327,14 @@ struct ClientHandler {
     app: AppHandle,
     window: String,
     channels: Channels,
+    agent_network: Arc<Desktop>,
 }
 
 impl Handler for ClientHandler {
     fn on_notification(&self, method: &str, params: Value) {
+        if self.agent_network.on_notification(method, &params) {
+            return;
+        }
         match method {
             "event" => match serde_json::from_value::<EventMessage>(params) {
                 Ok(m) => {
@@ -360,6 +368,9 @@ impl Handler for ClientHandler {
     }
 
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
+        if let Some(result) = self.agent_network.on_request(method, &params) {
+            return result;
+        }
         use ide_host::plugins::remote_host::{
             AUTH_REQUEST, AuthRequest, SECRET_REQUEST, SECRET_WRITE, SecretRequest, SecretWrite,
         };
@@ -631,8 +642,13 @@ pub async fn remote_connect(
     let label = AppState::owner_window(window.label()).to_owned();
     let request = RemoteRequest::new(&state, &label, request);
     let channels: Channels = Arc::default();
-    let handler =
-        Arc::new(ClientHandler { app: window.app_handle().clone(), window: label.clone(), channels: channels.clone() });
+    let agent_network: Arc<Desktop> = Arc::default();
+    let handler = Arc::new(ClientHandler {
+        app: window.app_handle().clone(),
+        window: label.clone(),
+        channels: channels.clone(),
+        agent_network: agent_network.clone(),
+    });
     let tail = crate::remote_wsl::Tail::default();
     let mut exec = None;
     let mut configured_ports = Vec::new();
@@ -749,6 +765,8 @@ pub async fn remote_connect(
         next_channel: std::sync::atomic::AtomicU64::new(1),
         session,
         forwards: Mutex::new(Vec::new()),
+        agent_network,
+        agent_network_change: tokio::sync::Mutex::new(()),
         exec,
     });
     if let RemoteTarget::DevContainer { folder, config } = &target {
@@ -774,6 +792,7 @@ pub async fn remote_connect(
         peer.closed().await;
         auth_plugins.forget_remote_loopbacks(&auth_window);
         if let Some(connection) = weak.upgrade() {
+            connection.agent_network.disable();
             connection.forwards.lock().clear();
         }
     });
@@ -908,6 +927,41 @@ fn connection(window: &Window, state: &AppState) -> IdeResult<Arc<Connection>> {
         .remote_dev
         .get(AppState::owner_window(window.label()))
         .ok_or_else(|| IdeError::unavailable("This window is not connected to a remote host"))
+}
+
+/// Whether agents in this remote window use the desktop's network. Pass a value to change it.
+#[tauri::command]
+#[specta::specta]
+pub async fn remote_agent_network(
+    window: Window,
+    state: State<'_, AppState>,
+    enabled: Option<bool>,
+) -> IdeResult<bool> {
+    let c = connection(&window, &state)?;
+    if !c.commands.iter().any(|cmd| cmd == agent_network::CONFIGURE) || c.peer.is_closed() {
+        return Err(IdeError::unavailable("This remote connection does not support agent network forwarding"));
+    }
+    let _change = c.agent_network_change.lock().await;
+    let current = c.agent_network.enabled();
+    let Some(enabled) = enabled.filter(|&value| value != current) else { return Ok(current) };
+    let owner = AppState::owner_window(window.label());
+    let token = if enabled {
+        c.authorize_command(owner, "agent_providers").await?;
+        Some(c.agent_network.enable(c.peer.clone())?)
+    } else {
+        c.agent_network.disable();
+        None
+    };
+    let call = Invoke {
+        window: owner.to_owned(),
+        cmd: agent_network::CONFIGURE.into(),
+        args: serde_json::json!({ "token": token }),
+    };
+    if let Err(error) = c.peer.request::<_, ()>("invoke", call, None).await {
+        c.agent_network.disable();
+        return Err(ide_host::rpc::error_from_reply(error));
+    }
+    Ok(enabled)
 }
 
 /// The remote ports this window forwards to this machine.

@@ -49,14 +49,18 @@ pub(crate) fn registry_paths(host: &Host) -> RegistryPaths {
     RegistryPaths::new(&host.config_dir, &host.local_data_dir)
 }
 
+fn registry_network(host: &Host, window: &str) -> RegistryPaths {
+    registry_paths(host).with_proxy(host.project(window).ok().and_then(|project| project.agents.network_proxy()))
+}
+
 fn join_err(e: impl std::fmt::Display) -> IdeError {
     IdeError::internal(e.to_string())
 }
 
 /// Agents of the ACP Registry this machine can run, with what is installed; the list
 /// saved earlier when the registry is unreachable. Cancel with `cancel_request(request)`.
-pub async fn registry_list(host: &Host, _window: &str, request: RequestId) -> IdeResult<AgentRegistry> {
-    let paths = registry_paths(host);
+pub async fn registry_list(host: &Host, window: &str, request: RequestId) -> IdeResult<AgentRegistry> {
+    let paths = registry_network(host, window);
     let cancel = host.begin_request(request);
     let result =
         tokio::task::spawn_blocking(move || ide_agent::registry::list(&paths, &cancel)).await.map_err(join_err);
@@ -101,12 +105,12 @@ impl Drop for Installing {
 /// `cancel_request(request)`.
 pub async fn registry_install(
     host: &Host,
-    _window: &str,
+    window: &str,
     id: String,
     request: RequestId,
     on_event: Channel<InstallEvent>,
 ) -> IdeResult<()> {
-    let paths = registry_paths(host);
+    let paths = registry_network(host, window);
     let installing = Installing::begin(&id)?;
     let cancel = host.begin_request(request);
     // Also a background task of every project window, so it stays visible and can be

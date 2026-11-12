@@ -345,6 +345,7 @@ pub fn restricted_command_allowed(cmd: &str) -> bool {
             | "agent_mcp_set_enabled"
             | "agent_mcp_remove"
             | "agent_mcp_import"
+            | crate::agent_network::CONFIGURE
             | "coverage_import"
             | "system_font_families"
             | "user_font_data"

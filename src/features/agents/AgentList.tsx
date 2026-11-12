@@ -10,6 +10,7 @@ import type { AgentConfigOption, AgentProvider, AgentRegistry, RegistryAgent, Re
 import { isCancelled, nextRequestId } from "@/platform/ipc";
 import { tx, useTxTemplate } from "@/platform/i18n";
 import { openExternalUrl } from "@/platform/openUrl";
+import { isRemoteWindow, useRemote } from "@/platform/remote";
 import clsx from "clsx";
 import { Button, Icon, IconButton, Input, List, ProgressBar, SearchField, Select, Spinner, T } from "@/ui";
 import { useSettingsForm } from "@/workbench/contributions";
@@ -86,10 +87,13 @@ export function agentRows(providers: AgentProvider[], registry: RegistryAgent[],
   ];
 }
 
+const hasCustomLaunch = (agent: AgentProvider) =>
+  agent.source.kind === "custom" || (agent.source.kind === "builtin" && agent.commandOverridden);
+
 /** What the agent needs, if anything, as a trailing tag in the list. */
 export function agentStatus(agent: AgentProvider): { label: string; tone: "muted" | "accent" } | null {
   if (agent.source.kind === "registry" && agent.source.update) return { label: "Update", tone: "accent" };
-  if (agent.commandOverridden || agent.source.kind === "custom") return { label: "Custom", tone: "accent" };
+  if (hasCustomLaunch(agent)) return { label: "Custom", tone: "accent" };
   if (!agent.installed) return { label: "Not found", tone: "muted" };
   return null;
 }
@@ -120,10 +124,12 @@ function AgentItem({ agent, working }: { agent: Agent; working: boolean }) {
 export function AgentList({
   backend,
   registry: registryBackend,
+  networkRevision,
   onChanged,
 }: {
   backend: CommandsBackend;
   registry: RegistryBackend;
+  networkRevision: number;
   onChanged?: () => void;
 }) {
   const [providers, setProviders] = useState<AgentProvider[] | null>(null);
@@ -151,13 +157,17 @@ export function AgentList({
     let live = true;
     registryBackend
       .list(request)
-      .then((r) => live && setRegistry(r))
+      .then((r) => {
+        if (!live) return;
+        setRegistryError(null);
+        setRegistry(r);
+      })
       .catch((e: unknown) => live && !isCancelled(e) && setRegistryError(errorText(e)));
     return () => {
       live = false;
       registryBackend.cancel(request);
     };
-  }, [registryBackend]);
+  }, [registryBackend, networkRevision]);
   const refresh = useCallback(async () => {
     setProviders(await backend.providers());
   }, [backend]);
@@ -251,7 +261,9 @@ export function AgentList({
     if (
       !(await confirm({
         title: tx`Remove ${agent.name}`,
-        message: tx`Remove ${agent.name} from this computer? Its tasks stay, but can't continue until it is installed again.`,
+        message: isRemoteWindow()
+          ? tx`Remove ${agent.name} from the remote host? Reinstall it to continue its tasks.`
+          : tx`Remove ${agent.name} from this computer? Its tasks stay, but can't continue until it is installed again.`,
         ok: tx("Remove"),
       }))
     )
@@ -424,6 +436,7 @@ function Details({
   onCancel: (request: RequestId) => void;
 }) {
   const { provider, registry } = agent;
+  const remote = useRemote((s) => s.session !== null);
   const installed = provider?.source.kind === "registry" || (!provider && registry?.installed != null);
   const canInstall = registry?.distribution != null;
   const update =
@@ -448,9 +461,7 @@ function Details({
                 aria-hidden
                 className={clsx(
                   styles.dot,
-                  provider.commandOverridden || provider.source.kind === "custom"
-                    ? styles.dotCustom
-                    : provider.installed && styles.dotFound,
+                  hasCustomLaunch(provider) ? styles.dotCustom : provider.installed && styles.dotFound,
                 )}
               />
             )}
@@ -514,10 +525,17 @@ function Details({
       {provider && <ProviderSettings agent={provider} backend={backend} refresh={refresh} onChanged={onChanged} />}
       {registry && (
         <p className={styles.thirdParty}>
-          <T>
-            Agents in the ACP Registry are third-party software. They run on this computer with your permissions and can
-            read and change your files. Install only agents you trust.
-          </T>
+          {remote ? (
+            <T>
+              Agents in the ACP Registry are third-party software. They run on the remote host with your permissions and
+              can read and change its files. Install only agents you trust.
+            </T>
+          ) : (
+            <T>
+              Agents in the ACP Registry are third-party software. They run on this computer with your permissions and
+              can read and change your files. Install only agents you trust.
+            </T>
+          )}
         </p>
       )}
     </section>
@@ -565,7 +583,7 @@ function ProviderSettings({
   useEffect(() => {
     if (!saving && current !== base) void refresh().catch((e: unknown) => setError(errorText(e)));
   }, [base, current, saving, refresh]);
-  const launch = [agent.defaultProgram, ...agent.defaultArgs].join(" ");
+  const launch = agent.commandEditable ? [agent.defaultProgram, ...agent.defaultArgs].join(" ") : agent.command;
   const envEditable = agent.commandReadOnlyReason !== "registry" && agent.commandReadOnlyReason !== "customAgent";
   return (
     <>
