@@ -22,6 +22,36 @@
   flex: 1;
   min-width: 0;
 }
+.containerActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.container {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 8px;
+  width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  background: none;
+  color: var(--fg);
+  text-align: left;
+  font: inherit;
+}
+.container small {
+  grid-column: 1 / -1;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+.container:hover {
+  background: var(--bg-hover);
+}
+.container[aria-pressed="true"] {
+  background: var(--accent-soft);
+}
 .folders {
   list-style: none;
   margin: 4px 0 0;

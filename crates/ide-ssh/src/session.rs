@@ -330,6 +330,11 @@ pub struct RemoteProcess {
 }
 
 impl RemoteProcess {
+    /// Stops this command without closing other channels of the SSH session.
+    pub async fn kill(&self) -> IdeResult<()> {
+        self.signal(Sig::KILL).await
+    }
+
     pub async fn write(&self, data: &[u8]) -> IdeResult<()> {
         self.write.data(data).await.map_err(|e| io(e.to_string()))
     }

@@ -7,7 +7,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { create } from "zustand";
 import { commands, isCancelled, isTauri, type Settings } from "@/platform/ipc";
 import { closeProject, openProject, startupLaunchHandled, useProject } from "@/platform/project";
-import { connectRemote, projectLocation, resolveRemoteLocation, useRemoteProgress } from "@/platform/remote";
+import {
+  cancelRemoteConnection,
+  connectRemote,
+  projectLocation,
+  resolveRemoteLocation,
+  useRemoteProgress,
+} from "@/platform/remote";
 import { notifications } from "@/workbench/contributions";
 
 const SESSION_KEY = "openidea.session.openProject";
@@ -94,7 +100,7 @@ export function cancelReopen() {
   if (useRemoteProgress.getState().location) {
     useRemoteProgress.setState({ progress: null, location: null });
     useProject.setState({ opening: false, openingPath: null });
-    if (isTauri()) void commands.remoteDisconnect().catch(() => {});
+    cancelRemoteConnection();
   }
 }
 

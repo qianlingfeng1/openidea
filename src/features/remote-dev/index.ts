@@ -4,6 +4,7 @@
  * to it (platform/remote.ts).
  */
 import { registerActions } from "@/platform/actions";
+import { call, commands } from "@/platform/ipc";
 import { disconnectRemote, useRemote } from "@/platform/remote";
 import { lazyComponent } from "@/ui";
 import { maybeEditorService, registerOverlay, registerStatusItem, registerToolWindow } from "@/workbench/contributions";
@@ -21,7 +22,7 @@ function trackPortsWindow(): () => void {
   let session = useRemote.getState().session;
   const sync = () => {
     const next = useRemote.getState().session;
-    const connected = next?.target.kind === "ssh" || next?.target.kind === "devContainer";
+    const connected = next !== null && next.target.kind !== "wsl";
     if (connected && (next !== session || !off)) {
       usePorts.setState({ ports: [] });
       void restorePorts();
@@ -73,6 +74,14 @@ export function activate(): () => void {
         run: () => openConnectDialog(),
       },
       {
+        id: "remote.attachContainer",
+        title: "Connect to Running Container…",
+        category: "File",
+        icon: "file-docker",
+        keywords: ["ssh", "docker", "container", "attach"],
+        run: () => openConnectDialog("attach"),
+      },
+      {
         id: "remote.disconnect",
         title: "Disconnect from Remote Host",
         category: "File",
@@ -89,6 +98,21 @@ export function activate(): () => void {
         },
       },
       {
+        id: "remote.reconnectContainer",
+        title: "Reconnect to Container",
+        category: "File",
+        enabled: () => {
+          const kind = useRemote.getState().session?.target.kind;
+          return kind === "sshContainer" || kind === "sshDevContainer";
+        },
+        run: async () => {
+          const session = useRemote.getState().session;
+          if (session?.target.kind !== "sshContainer" && session?.target.kind !== "sshDevContainer") return;
+          await call(commands.windowOpenRemote(session.target, session.root, true));
+          closeConnectDialog();
+        },
+      },
+      {
         id: "remote.reopenInContainer",
         title: "Reopen in Container",
         description:
@@ -97,7 +121,17 @@ export function activate(): () => void {
         icon: "folder",
         keywords: ["devcontainer", "dev container", "docker", "container", "remote"],
         when: "projectOpen",
-        run: () => reopenInContainer(),
+        enabled: () => {
+          const session = useRemote.getState().session;
+          return !session || session.target.kind === "ssh";
+        },
+        run: () => {
+          if (useRemote.getState().session?.target.kind === "ssh") {
+            openConnectDialog("reopen");
+            return;
+          }
+          return reopenInContainer();
+        },
       },
       {
         id: "remote.reloadEnvironment",

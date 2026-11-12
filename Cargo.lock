@@ -4725,6 +4725,7 @@ dependencies = [
  "dunce",
  "globset",
  "ide-core",
+ "ide-docker",
  "ide-run",
  "ide-ssh",
  "ignore",

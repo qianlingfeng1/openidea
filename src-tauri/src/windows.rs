@@ -892,7 +892,10 @@ impl Holds {
     fn of_remote(remote: &RemoteLaunch) -> Self {
         match &remote.target {
             RemoteTarget::Wsl { distro } => Holds::Wsl { distro: distro.clone(), path: remote.path.clone() },
-            RemoteTarget::Ssh { .. } | RemoteTarget::DevContainer { .. } => Holds::Other,
+            RemoteTarget::Ssh { .. }
+            | RemoteTarget::DevContainer { .. }
+            | RemoteTarget::SshContainer { .. }
+            | RemoteTarget::SshDevContainer { .. } => Holds::Other,
         }
     }
 

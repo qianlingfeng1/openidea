@@ -124,18 +124,26 @@ pub fn parse(text: &str) -> Result<DevContainer, String> {
         config.post_start = LifecycleCommand::parse(cmd).map_err(|e| format!("postStartCommand: {e}"))?;
     }
     // Only the desktop uses these: an entry it can't forward never makes the file unreadable.
-    if let Some(Value::Array(ports)) = top.get("forwardPorts") {
-        for entry in ports.iter().filter_map(forward_port) {
-            match entry {
-                (None, port) if !config.forward_ports.contains(&port) => config.forward_ports.push(port),
-                (Some(host), port) if !config.forward_host_ports.iter().any(|(h, p)| *h == host && *p == port) => {
-                    config.forward_host_ports.push((host, port));
-                }
-                _ => {}
-            }
+    for (host, port) in forward_ports(top.get("forwardPorts")) {
+        match host {
+            Some(host) => config.forward_host_ports.push((host, port)),
+            None => config.forward_ports.push(port),
         }
     }
     Ok(config)
+}
+
+/// Parses the unique port forwards from either the file or the CLI's merged configuration.
+pub fn forward_ports(value: Option<&Value>) -> Vec<(Option<String>, u16)> {
+    let mut forwards = Vec::new();
+    if let Some(Value::Array(ports)) = value {
+        for port in ports.iter().filter_map(forward_port) {
+            if !forwards.contains(&port) {
+                forwards.push(port);
+            }
+        }
+    }
+    forwards
 }
 
 /// A `forwardPorts` entry: a port of the container itself (`None`), or of another host it

@@ -2,14 +2,19 @@
 import { create } from "zustand";
 import type { RemoteEntry, RemoteStage } from "@/platform/ipc";
 
-export const useConnectDialog = create<{ open: boolean }>(() => ({ open: false }));
+type ConnectMode = "host" | "attach" | "reopen";
 
-export function openConnectDialog() {
-  useConnectDialog.setState({ open: true });
+export const useConnectDialog = create<{ open: boolean; mode: ConnectMode }>(() => ({
+  open: false,
+  mode: "host",
+}));
+
+export function openConnectDialog(mode: ConnectMode = "host") {
+  useConnectDialog.setState({ open: true, mode });
 }
 
 export function closeConnectDialog() {
-  useConnectDialog.setState({ open: false });
+  useConnectDialog.setState({ open: false, mode: "host" });
 }
 
 /** The parent of absolute POSIX path `path` (`/` stays `/`). */
