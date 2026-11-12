@@ -1,9 +1,7 @@
-name: OpenIDEA Dev Containers release
+name: OpenIDEA Dev Containers Docker compatibility release
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
 
 permissions:
   contents: read
@@ -15,6 +13,7 @@ concurrency:
 env:
   UPSTREAM: l0ng-ai/openidea
   PATCH_BRANCH: codex/builtin-devcontainers
+  PATCH_COMMIT: 5a2276351fe31ff8c76e1bbcc9f351d57ffd0433
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
@@ -34,18 +33,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Apply the built-in feature to the latest upstream release
+      - name: Prepare the Docker compatibility release
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          upstream_tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
-          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Unexpected upstream release tag: $upstream_tag"
-            exit 1
-          fi
-          release_tag="devcontainers-$upstream_tag"
+          upstream_tag=v0.1.42
+          version=0.1.43-devcontainers.1
+          release_tag="devcontainers-v$version"
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.draft | not) | .tag_name')
           if grep -Fxq "$release_tag" <<< "$published"; then
@@ -57,16 +53,36 @@ jobs:
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$upstream_tag"
           upstream_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
           git fetch --no-tags origin "refs/heads/$PATCH_BRANCH"
-          patch_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          patch_commit=$(git rev-parse "$PATCH_COMMIT^{commit}")
+          git merge-base --is-ancestor "$patch_commit" FETCH_HEAD
           base=$(git merge-base "$upstream_commit" "$patch_commit")
           source_date=$(git show -s --format=%cI "$patch_commit")
-          # Bindings are generated against the selected upstream version on Windows.
-          git diff --binary "$base" "$patch_commit" -- . ':(exclude)src/bindings.ts' > "$RUNNER_TEMP/feature.patch"
+          # Reuse the generated Windows bindings from this upstream version.
+          git diff --binary "$base" "$patch_commit" -- . > "$RUNNER_TEMP/feature.patch"
           git switch -c devcontainers-source "$upstream_commit"
           git apply --3way --index "$RUNNER_TEMP/feature.patch"
+          python3 - "${upstream_tag#v}" "$version" <<'PY'
+          from pathlib import Path
+          import sys
+
+          old, new = sys.argv[1:]
+          for name, key in (
+              ("Cargo.toml", "version = "),
+              ("Cargo.lock", "version = "),
+              ("package.json", '"version": '),
+              ("src-tauri/tauri.conf.json", '"version": '),
+          ):
+              path = Path(name)
+              text = path.read_text(encoding="utf-8")
+              previous = f'{key}"{old}"'
+              if previous not in text:
+                  raise SystemExit(f"{name}: expected version {old}")
+              path.write_text(text.replace(previous, f'{key}"{new}"'), encoding="utf-8")
+          PY
+          git add Cargo.toml Cargo.lock package.json src-tauri/tauri.conf.json
           export GIT_AUTHOR_DATE="$source_date" GIT_COMMITTER_DATE="$source_date"
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m "Add built-in Dev Containers to $upstream_tag" -m "Feature commit: $patch_commit"
+            commit -m "Build OpenIDEA Dev Containers $version on $upstream_tag" -m "Feature commit: $patch_commit"
           mkdir "$RUNNER_TEMP/devcontainers-source"
           git archive --format=zip -o "$RUNNER_TEMP/devcontainers-source/source.zip" HEAD
           git bundle create "$RUNNER_TEMP/devcontainers-source/source.bundle" refs/heads/devcontainers-source "^$upstream_commit"
@@ -75,7 +91,7 @@ jobs:
             echo "upstream_tag=$upstream_tag"
             echo "upstream_commit=$upstream_commit"
             echo "release_tag=$release_tag"
-            echo "version=${upstream_tag#v}"
+            echo "version=$version"
             echo "source_date=$source_date"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
@@ -131,8 +147,6 @@ jobs:
           Set-Content -LiteralPath $probe -Value 'OpenIDEA Dev Containers'
           pnpm exec tauri signer sign --app-version $env:VERSION $probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Generate the Tauri bindings
-        run: pnpm gen:bindings --release --target x86_64-pc-windows-msvc
       - uses: actions/upload-artifact@v4
         with:
           name: devcontainers-bindings
@@ -289,7 +303,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --title "OpenIDEA Dev Containers $VERSION" \
-              --notes "Based on $UPSTREAM $UPSTREAM_TAG. Includes built-in remote Docker and Dev Containers support."
+              --notes "Based on $UPSTREAM $UPSTREAM_TAG. Fixes SSH container connections with legacy Docker, including Docker 18.09.0."
           fi
           gh release upload "$RELEASE_TAG" "$artifacts/"* --clobber
           gh release edit "$RELEASE_TAG" --draft=false --latest
