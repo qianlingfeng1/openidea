@@ -2,6 +2,11 @@ name: OpenIDEA Dev Containers release
 
 on:
   workflow_dispatch:
+    inputs:
+      hotfix_revision:
+        description: 'Hotfix revision. Leave empty to publish the latest upstream stable version.'
+        required: false
+        type: string
   schedule:
     - cron: '3,13,23,33,43,53 * * * *'
 
@@ -14,18 +19,18 @@ concurrency:
 
 env:
   UPSTREAM: l0ng-ai/openidea
-  PATCH_BRANCH: codex/builtin-devcontainers
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
 jobs:
   prepare:
-    if: github.repository == 'qianlingfeng1/openidea'
+    if: github.repository == 'qianlingfeng1/openidea' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       ready: ${{ steps.source.outputs.ready }}
       upstream_tag: ${{ steps.source.outputs.upstream_tag }}
       upstream_commit: ${{ steps.source.outputs.upstream_commit }}
+      main_commit: ${{ steps.source.outputs.main_commit }}
       release_tag: ${{ steps.source.outputs.release_tag }}
       version: ${{ steps.source.outputs.version }}
       source_date: ${{ steps.source.outputs.source_date }}
@@ -34,10 +39,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Apply the built-in feature to the latest upstream release
+      - name: Prepare the release from main
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
+          HOTFIX_REVISION: ${{ inputs.hotfix_revision }}
         run: |
           set -euo pipefail
           upstream_tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
@@ -45,7 +51,17 @@ jobs:
             echo "::error::Unexpected upstream release tag: $upstream_tag"
             exit 1
           fi
-          release_tag="devcontainers-$upstream_tag"
+          base_version=${upstream_tag#v}
+          version=$base_version
+          if [[ -n "$HOTFIX_REVISION" ]]; then
+            if [[ ! "$HOTFIX_REVISION" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::The hotfix revision must be a positive integer."
+              exit 1
+            fi
+            IFS=. read -r major minor patch <<< "$base_version"
+            version="$major.$minor.$((10#$patch + 1))-devcontainers.$HOTFIX_REVISION"
+          fi
+          release_tag="devcontainers-v$version"
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.draft | not) | .tag_name')
           if grep -Fxq "$release_tag" <<< "$published"; then
@@ -56,17 +72,48 @@ jobs:
 
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$upstream_tag"
           upstream_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
-          git fetch --no-tags origin "refs/heads/$PATCH_BRANCH"
-          patch_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
-          base=$(git merge-base "$upstream_commit" "$patch_commit")
-          source_date=$(git show -s --format=%cI "$patch_commit")
-          # Bindings are generated against the selected upstream version on Windows.
-          git diff --binary "$base" "$patch_commit" -- . ':(exclude)src/bindings.ts' > "$RUNNER_TEMP/feature.patch"
-          git switch -c devcontainers-source "$upstream_commit"
-          git apply --3way --index "$RUNNER_TEMP/feature.patch"
+          source_date=$(git log --no-walk=sorted -1 --format=%cI "$GITHUB_SHA" "$upstream_commit")
           export GIT_AUTHOR_DATE="$source_date" GIT_COMMITTER_DATE="$source_date"
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m "Add built-in Dev Containers to $upstream_tag" -m "Feature commit: $patch_commit"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c devcontainers-source "$GITHUB_SHA"
+          if ! git merge-base --is-ancestor "$upstream_commit" HEAD; then
+            git merge --no-ff -m "Merge upstream $upstream_tag into main" "$upstream_commit"
+          fi
+          main_commit=$(git rev-parse HEAD)
+          echo "Building from main $main_commit with upstream $upstream_tag."
+          test "$(jq -er .version package.json)" = "$base_version"
+          if [[ "$version" != "$base_version" ]]; then
+            python3 - "$base_version" "$version" <<'PY'
+          from pathlib import Path
+          import sys
+          import tomllib
+
+          old, new = sys.argv[1:]
+          for name, key in (
+              ("Cargo.toml", "version = "),
+              ("package.json", '"version": '),
+              ("src-tauri/tauri.conf.json", '"version": '),
+          ):
+              path = Path(name)
+              text = path.read_text(encoding="utf-8")
+              previous = f'{key}"{old}"'
+              if previous not in text:
+                  raise SystemExit(f"{name}: expected version {old}")
+              path.write_text(text.replace(previous, f'{key}"{new}"', 1), encoding="utf-8")
+
+          lock = Path("Cargo.lock")
+          delimiter = "\n[[package]]\n"
+          header, *packages = lock.read_text(encoding="utf-8").split(delimiter)
+          for index, text in enumerate(packages):
+              package = tomllib.loads("[[package]]\n" + text)["package"][0]
+              if "source" not in package and package["version"] == old:
+                  packages[index] = text.replace(f'version = "{old}"', f'version = "{new}"', 1)
+          lock.write_text(delimiter.join([header, *packages]), encoding="utf-8")
+          PY
+            git add Cargo.toml Cargo.lock package.json src-tauri/tauri.conf.json
+            git commit -m "Set personal release version to $version"
+          fi
           mkdir "$RUNNER_TEMP/devcontainers-source"
           git archive --format=zip -o "$RUNNER_TEMP/devcontainers-source/source.zip" HEAD
           git bundle create "$RUNNER_TEMP/devcontainers-source/source.bundle" refs/heads/devcontainers-source "^$upstream_commit"
@@ -74,8 +121,9 @@ jobs:
             echo 'ready=true'
             echo "upstream_tag=$upstream_tag"
             echo "upstream_commit=$upstream_commit"
+            echo "main_commit=$main_commit"
             echo "release_tag=$release_tag"
-            echo "version=${upstream_tag#v}"
+            echo "version=$version"
             echo "source_date=$source_date"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
@@ -239,12 +287,15 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
       UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_commit }}
+      MAIN_COMMIT: ${{ needs.prepare.outputs.main_commit }}
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
       GIT_AUTHOR_DATE: ${{ needs.prepare.outputs.source_date }}
       GIT_COMMITTER_DATE: ${{ needs.prepare.outputs.source_date }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: devcontainers-source
@@ -270,14 +321,21 @@ jobs:
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$UPSTREAM_TAG"
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_COMMIT"
           git fetch "$RUNNER_TEMP/devcontainers-source/source.bundle" refs/heads/devcontainers-source
-          git switch --detach FETCH_HEAD
+          source_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          git switch --detach "$MAIN_COMMIT"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           cp "$RUNNER_TEMP/devcontainers-bindings/bindings.ts" src/bindings.ts
           git add src/bindings.ts
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -m "Generate Windows IPC bindings for $UPSTREAM_TAG"
+            git commit -m "Generate Windows IPC bindings for $UPSTREAM_TAG"
           fi
-          git push origin "HEAD:refs/tags/$RELEASE_TAG"
+          tested_main=$(git rev-parse HEAD)
+          if [[ "$source_commit" != "$MAIN_COMMIT" ]]; then
+            test "$(git rev-parse "$source_commit^")" = "$MAIN_COMMIT"
+            git cherry-pick "$source_commit"
+          fi
+          git push --atomic origin "$tested_main:refs/heads/main" "HEAD:refs/tags/$RELEASE_TAG"
 
           release_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
           jq -n --arg version "$VERSION" --arg url "$release_url/$installer" \
@@ -289,7 +347,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --title "OpenIDEA Dev Containers $VERSION" \
-              --notes "Based on $UPSTREAM $UPSTREAM_TAG. Includes built-in remote Docker and Dev Containers support."
+              --notes "Built from personal main commit $tested_main, based on $UPSTREAM $UPSTREAM_TAG. Includes the fork's remote development features and fixes."
           fi
           gh release upload "$RELEASE_TAG" "$artifacts/"* --clobber
           gh release edit "$RELEASE_TAG" --draft=false --latest
