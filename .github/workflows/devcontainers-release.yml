@@ -1,0 +1,283 @@
+name: OpenIDEA Dev Containers release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcontainers-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: l0ng-ai/openidea
+  PATCH_BRANCH: codex/builtin-devcontainers
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    if: github.repository == 'qianlingfeng1/openidea'
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.source.outputs.ready }}
+      upstream_tag: ${{ steps.source.outputs.upstream_tag }}
+      upstream_commit: ${{ steps.source.outputs.upstream_commit }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      version: ${{ steps.source.outputs.version }}
+      source_date: ${{ steps.source.outputs.source_date }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply the built-in feature to the latest upstream release
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream release tag: $upstream_tag"
+            exit 1
+          fi
+          release_tag="devcontainers-$upstream_tag"
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft | not) | .tag_name')
+          if grep -Fxq "$release_tag" <<< "$published"; then
+            echo "Release $release_tag is already published."
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$upstream_tag"
+          upstream_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          git fetch --no-tags origin "refs/heads/$PATCH_BRANCH"
+          patch_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          base=$(git merge-base "$upstream_commit" "$patch_commit")
+          source_date=$(git show -s --format=%cI "$patch_commit")
+          # Bindings are generated against the selected upstream version on Windows.
+          git diff --binary "$base" "$patch_commit" -- . ':(exclude)src/bindings.ts' > "$RUNNER_TEMP/feature.patch"
+          git switch -c devcontainers-source "$upstream_commit"
+          git apply --3way --index "$RUNNER_TEMP/feature.patch"
+          export GIT_AUTHOR_DATE="$source_date" GIT_COMMITTER_DATE="$source_date"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "Add built-in Dev Containers to $upstream_tag" -m "Feature commit: $patch_commit"
+          mkdir "$RUNNER_TEMP/devcontainers-source"
+          git archive --format=zip -o "$RUNNER_TEMP/devcontainers-source/source.zip" HEAD
+          git bundle create "$RUNNER_TEMP/devcontainers-source/source.bundle" refs/heads/devcontainers-source "^$upstream_commit"
+          {
+            echo 'ready=true'
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_commit=$upstream_commit"
+            echo "release_tag=$release_tag"
+            echo "version=${upstream_tag#v}"
+            echo "source_date=$source_date"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.source.outputs.ready == 'true'
+        with:
+          name: devcontainers-source
+          path: ${{ runner.temp }}/devcontainers-source
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: windows-latest
+    env:
+      OPENIDEA_SERVER_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download
+      OPENIDEA_SERVER_RELEASE_TAG_PREFIX: devcontainers-v
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: devcontainers-source
+          path: ${{ runner.temp }}/devcontainers-source
+      - name: Extract source
+        run: Expand-Archive -LiteralPath "$env:RUNNER_TEMP/devcontainers-source/source.zip" -DestinationPath .
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 11
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: devcontainers-windows-x64
+      - run: pnpm install --frozen-lockfile
+      - name: Generate the Tauri bindings
+        run: pnpm gen:bindings --release --target x86_64-pc-windows-msvc
+      - name: Verify remote development
+        run: pnpm vitest run src/features/remote-dev src/features/welcome src/platform/remote.test.ts src/platform/locales/textCatalog.test.ts
+      - name: Build and sign the Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.DEVCONTAINERS_TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.DEVCONTAINERS_TAURI_KEY_PASSWORD }}
+          UPDATER_PUBLIC_KEY: ${{ vars.DEVCONTAINERS_TAURI_PUBLIC_KEY }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:UPDATER_PUBLIC_KEY) {
+            throw "Configure the Dev Containers updater signing keys before building."
+          }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($version -ne $env:VERSION) { throw "Release tag and desktop version differ." }
+          $config = Join-Path $env:RUNNER_TEMP 'devcontainers-tauri.json'
+          @{
+            productName = 'OpenIDEA Dev Containers'
+            identifier = 'io.github.qianlingfeng1.openidea.devcontainers'
+            bundle = @{ targets = @('nsis'); createUpdaterArtifacts = $true }
+            plugins = @{
+              updater = @{
+                pubkey = $env:UPDATER_PUBLIC_KEY
+                endpoints = @("https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/latest.json")
+              }
+            }
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $config -Encoding utf8NoBOM
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config $config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installers = @(Get-ChildItem -LiteralPath 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected one Windows installer." }
+          $installer = $installers[0].FullName
+          $out = Join-Path $env:RUNNER_TEMP 'devcontainers-package'
+          New-Item -Path $out -ItemType Directory | Out-Null
+          $name = "OpenIDEA-Dev-Containers-$version-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer -Destination (Join-Path $out $name)
+          Copy-Item -LiteralPath "$installer.sig" -Destination (Join-Path $out "$name.sig")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devcontainers-package-windows-x64
+          path: ${{ runner.temp }}/devcontainers-package
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devcontainers-bindings
+          path: src/bindings.ts
+          if-no-files-found: error
+
+  server:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: devcontainers-source
+          path: ${{ runner.temp }}/devcontainers-source
+      - run: unzip -q "$RUNNER_TEMP/devcontainers-source/source.zip"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: devcontainers-server-${{ matrix.arch }}
+      - name: Build the matching Linux backend
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          export "CC_${TARGET//-/_}=musl-gcc"
+          cargo build --release --locked -p ide-host --bin openidea-server --target "$TARGET"
+          if [ "$ARCH" = x86_64 ]; then
+            cargo test --release --locked -p ide-remote --lib --target "$TARGET"
+          fi
+          server="target/$TARGET/release/openidea-server"
+          "$server" --version | grep -F "openidea-server $VERSION"
+          out="$RUNNER_TEMP/devcontainers-package"
+          mkdir "$out"
+          asset="openidea-server-linux-$ARCH.gz"
+          gzip -9 -c "$server" > "$out/$asset"
+          (cd "$out" && sha256sum "$asset" > "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devcontainers-package-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/devcontainers-package
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, windows, server]
+    if: needs.prepare.outputs.ready == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+      UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_commit }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GIT_AUTHOR_DATE: ${{ needs.prepare.outputs.source_date }}
+      GIT_COMMITTER_DATE: ${{ needs.prepare.outputs.source_date }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: devcontainers-source
+          path: ${{ runner.temp }}/devcontainers-source
+      - uses: actions/download-artifact@v4
+        with:
+          name: devcontainers-bindings
+          path: ${{ runner.temp }}/devcontainers-bindings
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: devcontainers-package-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/devcontainers-package
+      - name: Publish the matching installer, servers, and update manifest
+        run: |
+          set -euo pipefail
+          artifacts="$RUNNER_TEMP/devcontainers-package"
+          installer="OpenIDEA-Dev-Containers-$VERSION-windows-x64-setup.exe"
+          test -s "$artifacts/$installer"
+          test -s "$artifacts/$installer.sig"
+          (cd "$artifacts" && sha256sum -c openidea-server-linux-x86_64.gz.sha256 openidea-server-linux-aarch64.gz.sha256)
+
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$UPSTREAM_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_COMMIT"
+          git fetch "$RUNNER_TEMP/devcontainers-source/source.bundle" refs/heads/devcontainers-source
+          git switch --detach FETCH_HEAD
+          cp "$RUNNER_TEMP/devcontainers-bindings/bindings.ts" src/bindings.ts
+          git add src/bindings.ts
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Generate Windows IPC bindings for $UPSTREAM_TAG"
+          fi
+          git push origin "HEAD:refs/tags/$RELEASE_TAG"
+
+          release_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          jq -n --arg version "$VERSION" --arg url "$release_url/$installer" \
+            --arg signature "$(cat "$artifacts/$installer.sig")" \
+            '{version:$version, platforms:{"windows-x86_64":{url:$url,signature:$signature},"windows-x86_64-nsis":{url:$url,signature:$signature}}}' \
+            > "$artifacts/latest.json"
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then exit 0; fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "OpenIDEA Dev Containers $VERSION" \
+              --notes "Based on $UPSTREAM $UPSTREAM_TAG. Includes built-in remote Docker and Dev Containers support."
+          fi
+          gh release upload "$RELEASE_TAG" "$artifacts/"* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
