@@ -93,6 +93,8 @@ jobs:
     env:
       OPENIDEA_SERVER_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download
       OPENIDEA_SERVER_RELEASE_TAG_PREFIX: devcontainers-v
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
@@ -114,12 +116,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: devcontainers-windows-x64
+          cache-on-failure: true
       - run: pnpm install --frozen-lockfile
-      - name: Generate the Tauri bindings
-        run: pnpm gen:bindings --release --target x86_64-pc-windows-msvc
-      - name: Verify remote development
-        run: pnpm vitest run src/features/remote-dev src/features/welcome src/platform/remote.test.ts src/platform/locales/textCatalog.test.ts
-      - name: Build and sign the Windows installer
+      - name: Verify the updater signing key
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.DEVCONTAINERS_TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.DEVCONTAINERS_TAURI_KEY_PASSWORD }}
@@ -128,6 +127,25 @@ jobs:
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:UPDATER_PUBLIC_KEY) {
             throw "Configure the Dev Containers updater signing keys before building."
           }
+          $probe = Join-Path $env:RUNNER_TEMP 'signing-probe.txt'
+          Set-Content -LiteralPath $probe -Value 'OpenIDEA Dev Containers'
+          pnpm exec tauri signer sign --app-version $env:VERSION $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Generate the Tauri bindings
+        run: pnpm gen:bindings --release --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devcontainers-bindings
+          path: src/bindings.ts
+          if-no-files-found: error
+      - name: Verify remote development
+        run: pnpm vitest run src/features/remote-dev src/features/welcome src/platform/remote.test.ts src/platform/locales/textCatalog.test.ts
+      - name: Build and sign the Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.DEVCONTAINERS_TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.DEVCONTAINERS_TAURI_KEY_PASSWORD }}
+          UPDATER_PUBLIC_KEY: ${{ vars.DEVCONTAINERS_TAURI_PUBLIC_KEY }}
+        run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($version -ne $env:VERSION) { throw "Release tag and desktop version differ." }
           $config = Join-Path $env:RUNNER_TEMP 'devcontainers-tauri.json'
@@ -156,11 +174,6 @@ jobs:
         with:
           name: devcontainers-package-windows-x64
           path: ${{ runner.temp }}/devcontainers-package
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: devcontainers-bindings
-          path: src/bindings.ts
           if-no-files-found: error
 
   server:
