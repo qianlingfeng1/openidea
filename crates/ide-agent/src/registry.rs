@@ -10,6 +10,7 @@
 use crate::provider::{self, CustomAgent, Driver, RegistryRef};
 use crate::{AgentProvider, AgentSource};
 use ide_core::error::ErrorKind;
+use ide_core::proxy_settings::ProxySettings;
 use ide_core::{CancellationToken, IdeError, IdeResult};
 use ide_tools::archive::{self, ArchiveKind};
 use ide_tools::platform::{Arch, Os, Platform};
@@ -21,7 +22,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
+
+mod bundled;
+
+use bundled::{CODEX, QODER};
 
 pub const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
@@ -37,6 +43,7 @@ pub struct RegistryPaths {
     pub tools_dir: PathBuf,
     /// The index as last fetched, for offline use and update checks.
     pub cache_file: PathBuf,
+    proxy: Option<Arc<ProxySettings>>,
 }
 
 impl RegistryPaths {
@@ -45,7 +52,13 @@ impl RegistryPaths {
             agents_dir: config_dir.join("agents"),
             tools_dir: data_dir.join("agents").join("tools"),
             cache_file: data_dir.join("agents").join("registry.json"),
+            proxy: None,
         }
+    }
+
+    pub fn with_proxy(mut self, proxy: Option<Arc<ProxySettings>>) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     fn agent_file(&self, id: &str) -> PathBuf {
@@ -166,7 +179,7 @@ fn parse(text: &str) -> IdeResult<Vec<Entry>> {
         .agents
         .into_iter()
         .filter_map(|v| serde_json::from_value::<Entry>(v).ok())
-        .filter(|e| safe_segment(&e.id) && safe_segment(&e.version))
+        .filter(|e| e.id != CODEX && safe_segment(&e.id) && safe_segment(&e.version))
         .map(|mut e| {
             e.id = canonical_id(&e.id).to_owned();
             if let Some(name) = provider::builtin_name(&e.id) {
@@ -250,11 +263,27 @@ fn canonical_id(id: &str) -> &str {
 }
 
 fn is_builtin(id: &str) -> bool {
-    provider::is_builtin(canonical_id(id))
+    id != CODEX && provider::is_builtin(canonical_id(id))
 }
 
 fn on_path(command: &str) -> bool {
     which::which(command).is_ok()
+}
+
+fn catalog(mut entries: Vec<Entry>, platform: Platform, on_path: &dyn Fn(&str) -> bool) -> Vec<Entry> {
+    for bundled in bundled::entries() {
+        match entries.iter_mut().find(|entry| entry.id == bundled.id) {
+            Some(entry) => {
+                if choose(&bundled, platform, on_path).is_some()
+                    && (!is_newer(&entry.version, &bundled.version) || choose(entry, platform, on_path).is_none())
+                {
+                    *entry = bundled;
+                }
+            }
+            None => entries.push(bundled),
+        }
+    }
+    entries
 }
 
 /// `1.10.0` > `1.9.2`; a release is newer than its pre-releases.
@@ -283,18 +312,19 @@ fn is_newer(latest: &str, current: &str) -> bool {
 /// Registry agents this machine can run, except built-in ones and ids the user's own
 /// agent files take. Falls back to the saved index when the registry is unreachable.
 pub fn list(paths: &RegistryPaths, cancel: &CancellationToken) -> IdeResult<AgentRegistry> {
-    let (text, warning) = match fetch(paths, cancel) {
-        Ok(text) => (text, None),
+    let (entries, warning) = match fetch(paths, cancel) {
+        Ok(text) => (parse(&text)?, None),
         Err(e) if e.kind == ErrorKind::Cancelled => return Err(e),
         Err(e) => match fs::read_to_string(&paths.cache_file) {
             Ok(text) => (
-                text,
+                parse(&text)?,
                 Some(format!("Could not reach the ACP Registry ({}); showing the list saved earlier.", e.message)),
             ),
-            Err(_) => return Err(e),
+            Err(_) => (Vec::new(), Some(e.message)),
         },
     };
-    let agents = visible(paths, &parse(&text)?, Platform::current(), &on_path);
+    let platform = Platform::current();
+    let agents = visible(paths, &catalog(entries, platform, &on_path), platform, &on_path);
     Ok(AgentRegistry { agents, warning })
 }
 
@@ -344,7 +374,8 @@ fn visible(
 
 /// Fills in [`AgentSource::Registry::update`] from the saved index.
 pub fn mark_updates(paths: &RegistryPaths, providers: &mut [AgentProvider]) {
-    let Some(entries) = fs::read_to_string(&paths.cache_file).ok().and_then(|t| parse(&t).ok()) else { return };
+    let entries = fs::read_to_string(&paths.cache_file).ok().and_then(|t| parse(&t).ok()).unwrap_or_default();
+    let entries = catalog(entries, Platform::current(), &on_path);
     for p in providers {
         if let AgentSource::Registry { version, update } = &mut p.source
             && let Some(e) = entries.iter().find(|e| e.id == p.id)
@@ -356,8 +387,11 @@ pub fn mark_updates(paths: &RegistryPaths, providers: &mut [AgentProvider]) {
 }
 
 /// HTTPS only, redirects included. Tests serve downloads over `file://`.
-fn http() -> IdeResult<Http> {
-    let http = Http::new(&ide_core::tool_path::search_path())?;
+fn http(paths: &RegistryPaths) -> IdeResult<Http> {
+    let mut http = Http::new(&ide_core::tool_path::search_path())?;
+    if let Some(proxy) = &paths.proxy {
+        http = http.with_proxy(proxy.clone());
+    }
     Ok(if cfg!(test) { http } else { http.https_only() })
 }
 
@@ -379,7 +413,7 @@ fn check_spec(spec: &str) -> IdeResult<()> {
 }
 
 fn fetch(paths: &RegistryPaths, cancel: &CancellationToken) -> IdeResult<String> {
-    let http = http()?;
+    let http = http(paths)?;
     let text = http.get_text_limited(REGISTRY_URL, Some(MAX_REGISTRY_BYTES), cancel)?;
     parse(&text)?;
     if let Err(e) = write_atomic(&paths.cache_file, text.as_bytes()) {
@@ -404,16 +438,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub fn install(paths: &RegistryPaths, id: &str, cancel: &CancellationToken, emit: Emit) -> IdeResult<()> {
     let id = canonical_id(id);
     // The saved index is what the user picked from; fetch only when there is none.
-    let text = match fs::read_to_string(&paths.cache_file) {
-        Ok(text) => text,
-        Err(_) => fetch(paths, cancel)?,
+    let entries = match fs::read_to_string(&paths.cache_file) {
+        Ok(text) => parse(&text)?,
+        Err(_) if matches!(id, CODEX | QODER) => Vec::new(),
+        Err(_) => parse(&fetch(paths, cancel)?)?,
     };
-    let entries = parse(&text)?;
+    let platform = Platform::current();
+    let entries = catalog(entries, platform, &on_path);
     let entry = entries
         .iter()
         .find(|e| e.id == id)
         .ok_or_else(|| IdeError::not_found(format!("{id} is not in the ACP Registry")))?;
-    install_entry(paths, entry, Platform::current(), &on_path, cancel, emit)
+    install_entry(paths, entry, platform, &on_path, cancel, emit)
 }
 
 fn install_entry(
@@ -443,13 +479,13 @@ fn install_entry(
     }
     fs::create_dir_all(&dir)?;
     let installed = match &choice {
-        Choice::Binary(b) => install_binary(b, &dir, cancel, emit).map(|exe| (exe, b.args.clone(), b.env.clone())),
-        Choice::Npx(p) => {
-            install_npm(p, entry, &dir, platform, cancel, emit).map(|exe| (exe, p.args.clone(), p.env.clone()))
+        Choice::Binary(b) => {
+            install_binary(paths, b, &dir, cancel, emit).map(|exe| (exe, b.args.clone(), b.env.clone()))
         }
-        Choice::Uvx(p) => {
-            install_uv(p, entry, &dir, platform, cancel, emit).map(|exe| (exe, p.args.clone(), p.env.clone()))
-        }
+        Choice::Npx(p) => install_npm(p, entry, &dir, platform, paths.proxy.as_deref(), cancel, emit)
+            .map(|exe| (exe, p.args.clone(), p.env.clone())),
+        Choice::Uvx(p) => install_uv(p, entry, &dir, platform, paths.proxy.as_deref(), cancel, emit)
+            .map(|exe| (exe, p.args.clone(), p.env.clone())),
     };
     let (exe, args, env) = match installed {
         Ok(x) => x,
@@ -460,7 +496,7 @@ fn install_entry(
     };
     let agent = CustomAgent {
         name: Some(entry.name.clone()),
-        driver: Driver::Acp,
+        driver: if entry.id == CODEX { Driver::Codex } else { Driver::Acp },
         command: exe.to_string_lossy().into_owned(),
         args,
         env,
@@ -495,7 +531,13 @@ fn command_path(cmd: &str) -> IdeResult<Vec<String>> {
     Ok(parts)
 }
 
-fn install_binary(b: &Binary, dir: &Path, cancel: &CancellationToken, emit: Emit) -> IdeResult<PathBuf> {
+fn install_binary(
+    paths: &RegistryPaths,
+    b: &Binary,
+    dir: &Path,
+    cancel: &CancellationToken,
+    emit: Emit,
+) -> IdeResult<PathBuf> {
     let segments = command_path(&b.cmd)?;
     check_url(&b.archive)?;
     let url_path = b.archive.split(['?', '#']).next().unwrap_or_default();
@@ -508,7 +550,7 @@ fn install_binary(b: &Binary, dir: &Path, cancel: &CancellationToken, emit: Emit
     fs::create_dir_all(&downloads)?;
     let file = downloads.join(name);
     emit(InstallEvent::Line { text: format!("Downloading {}", b.archive) });
-    http()?.download(&b.archive, &file, None, cancel, emit)?;
+    http(paths)?.download(&b.archive, &file, None, cancel, emit)?;
     match &b.sha256 {
         Some(expected) => {
             verify_sha256(&file, expected)?;
@@ -565,6 +607,7 @@ fn install_npm(
     entry: &Entry,
     dir: &Path,
     platform: Platform,
+    proxy: Option<&ProxySettings>,
     cancel: &CancellationToken,
     emit: Emit,
 ) -> IdeResult<PathBuf> {
@@ -577,6 +620,9 @@ fn install_npm(
     let npm = which::which("npm").map_err(|_| IdeError::unavailable(format!("npm is required to install {name}")))?;
     let mut cmd = Command::new(npm);
     cmd.arg("install").arg("--prefix").arg(dir).args(["--no-audit", "--no-fund"]).arg(&spec).current_dir(dir);
+    if let Some(proxy) = proxy {
+        cmd.envs(crate::network_env(proxy));
+    }
     ide_tools::run_streamed(cmd, cancel, emit)?;
     let modules = dir.join("node_modules");
     let manifest: serde_json::Value = fs::read_to_string(modules.join(name).join("package.json"))
@@ -607,6 +653,7 @@ fn install_uv(
     entry: &Entry,
     dir: &Path,
     platform: Platform,
+    proxy: Option<&ProxySettings>,
     cancel: &CancellationToken,
     emit: Emit,
 ) -> IdeResult<PathBuf> {
@@ -624,6 +671,9 @@ fn install_uv(
         .env("UV_TOOL_DIR", dir.join("tools"))
         .env("UV_TOOL_BIN_DIR", &bin)
         .current_dir(dir);
+    if let Some(proxy) = proxy {
+        cmd.envs(crate::network_env(proxy));
+    }
     ide_tools::run_streamed(cmd, cancel, emit)?;
     let exe = [name, entry.id.as_str()].iter().map(|n| bin.join(platform.exe(n))).find(|p| p.is_file()).or_else(|| {
         let files: Vec<PathBuf> = fs::read_dir(&bin).ok()?.flatten().map(|e| e.path()).collect();

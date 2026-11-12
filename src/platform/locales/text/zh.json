@@ -1,4 +1,6 @@
 {
+  "Use this computer's network for agents": "Agent 使用本机网络",
+  "Routes API requests from newly started agents and agent downloads through this computer for the current remote connection.": "在当前远程连接中，新启动的 Agent 的 API 请求和 Agent 安装下载都通过本机网络。",
   "GDB (C, C++)": "GDB（C、C++）",
   "Unknown error": "未知错误",
   "Retry Loading Conversation": "重新加载对话",

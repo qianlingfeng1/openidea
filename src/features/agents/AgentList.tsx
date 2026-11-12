@@ -120,10 +120,12 @@ function AgentItem({ agent, working }: { agent: Agent; working: boolean }) {
 export function AgentList({
   backend,
   registry: registryBackend,
+  networkRevision,
   onChanged,
 }: {
   backend: CommandsBackend;
   registry: RegistryBackend;
+  networkRevision: number;
   onChanged?: () => void;
 }) {
   const [providers, setProviders] = useState<AgentProvider[] | null>(null);
@@ -151,13 +153,17 @@ export function AgentList({
     let live = true;
     registryBackend
       .list(request)
-      .then((r) => live && setRegistry(r))
+      .then((r) => {
+        if (!live) return;
+        setRegistryError(null);
+        setRegistry(r);
+      })
       .catch((e: unknown) => live && !isCancelled(e) && setRegistryError(errorText(e)));
     return () => {
       live = false;
       registryBackend.cancel(request);
     };
-  }, [registryBackend]);
+  }, [registryBackend, networkRevision]);
   const refresh = useCallback(async () => {
     setProviders(await backend.providers());
   }, [backend]);

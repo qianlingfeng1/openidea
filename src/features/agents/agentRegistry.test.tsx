@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { AgentProvider, AgentRegistry, InstallEvent, RegistryAgent, RequestId } from "@/bindings";
-import { IpcError } from "@/platform/ipc";
+import { IpcError, commands } from "@/platform/ipc";
 import { setLocale, tx } from "@/platform/i18n";
+import { useRemote } from "@/platform/remote";
 import { iconMarkup } from "@/ui/icons";
 import { MessagesHost } from "@/workbench/messages";
 import { AgentRegistryPage as RegistryPage } from "./AgentRegistryPage";
@@ -212,6 +213,38 @@ describe("the ACP Registry in the agent list", () => {
       </>,
     );
   };
+  it("reloads the registry through the new route when local networking is enabled", async () => {
+    const backend = new FakeBackend();
+    const list = vi.spyOn(backend, "list");
+    const network = vi.spyOn(commands, "remoteAgentNetwork").mockImplementation(async (enabled) => ({
+      status: "ok",
+      data: enabled ?? false,
+    }));
+    useRemote.setState({
+      session: {
+        target: { kind: "ssh", config: "server" },
+        root: "/project",
+        host: "server",
+        os: "linux",
+        commands: ["agent_configure_network"],
+      },
+    });
+    try {
+      renderRegistry(backend);
+      const toggle = screen.getByRole("checkbox", { name: "Use this computer's network for agents" });
+      await waitFor(() => expect(toggle).toBeEnabled());
+      expect(toggle).not.toBeChecked();
+      expect(list).toHaveBeenCalledTimes(1);
+      fireEvent.click(toggle);
+      await waitFor(() => expect(toggle).toBeChecked());
+      expect(network).toHaveBeenCalledWith(true);
+      expect(list).toHaveBeenCalledTimes(2);
+    } finally {
+      act(() => useRemote.setState({ session: null }));
+      network.mockRestore();
+    }
+  });
+
   it("shows the built-in Copilot name and icon in its registry row", async () => {
     const backend = new FakeBackend();
     backend.registry = { agents: [agent({ id: "copilot", name: "GitHub Copilot" })], warning: null };

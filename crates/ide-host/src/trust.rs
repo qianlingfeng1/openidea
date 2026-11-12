@@ -335,6 +335,7 @@ pub fn restricted_command_allowed(cmd: &str) -> bool {
             | "agent_registry_list"
             | "agent_registry_install"
             | "agent_registry_remove"
+            | crate::agent_network::CONFIGURE
             | "coverage_import"
             | "system_font_families"
             | "user_font_data"

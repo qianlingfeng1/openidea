@@ -1,4 +1,6 @@
 {
+  "Use this computer's network for agents": "Use this computer's network for agents",
+  "Routes API requests from newly started agents and agent downloads through this computer for the current remote connection.": "Routes API requests from newly started agents and agent downloads through this computer for the current remote connection.",
   "GDB (C, C++)": "GDB (C, C++)",
   "Unknown error": "Unknown error",
   "Retry Loading Conversation": "Retry Loading Conversation",

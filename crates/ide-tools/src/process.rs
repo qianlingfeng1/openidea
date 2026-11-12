@@ -280,6 +280,7 @@ pub struct Http {
     explicit_github_token: Option<String>,
     https_only: bool,
     revoke_best_effort: bool,
+    proxy: Option<std::sync::Arc<ide_core::proxy_settings::ProxySettings>>,
 }
 
 impl Http {
@@ -289,12 +290,18 @@ impl Http {
         let gh = which::which_in("gh", Some(search_path), ".").ok();
         let explicit_github_token = environment_github_token(|key| std::env::var(key).ok());
         let revoke_best_effort = cfg!(windows) && revoke_best_effort(&curl);
-        Ok(Self { curl, gh, explicit_github_token, https_only: false, revoke_best_effort })
+        Ok(Self { curl, gh, explicit_github_token, https_only: false, revoke_best_effort, proxy: None })
     }
 
     /// Refuses every protocol but HTTPS, redirects included.
     pub fn https_only(mut self) -> Self {
         self.https_only = true;
+        self
+    }
+
+    /// Proxy for these downloads, independent of the system proxy.
+    pub fn with_proxy(mut self, proxy: std::sync::Arc<ide_core::proxy_settings::ProxySettings>) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 
@@ -317,13 +324,27 @@ impl Http {
         let mut cmd = Command::new(&self.curl);
         // A user curlrc must not enable verbose token logging or forwarding
         // Authorization across origins on authenticated API requests.
-        if token.is_some() {
+        if token.is_some() || self.proxy.is_some() {
             cmd.arg("-q");
         }
         own_group(ide_core::process::prepare(&mut cmd));
         cmd.args(["-fsSL", "--retry", "2", "--connect-timeout", "20", "-A", "openidea"]);
         // System Settings › HTTP Proxy (a manual proxy comes in through `prepare`'s environment).
-        cmd.args(ide_core::proxy_settings::proxy().curl_args(url));
+        if let Some(proxy) = &self.proxy {
+            cmd.args(proxy.curl_args(url));
+            for (name, value) in proxy.child_env() {
+                match value {
+                    Some(value) => {
+                        cmd.env(name, value);
+                    }
+                    None => {
+                        cmd.env_remove(name);
+                    }
+                }
+            }
+        } else {
+            cmd.args(ide_core::proxy_settings::proxy().curl_args(url));
+        }
         if self.https_only {
             cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
         }
@@ -700,6 +721,7 @@ mod tests {
             explicit_github_token: None,
             https_only: false,
             revoke_best_effort: false,
+            proxy: None,
         };
         for (code, exit, expected) in [(404, 22, Some("[]")), (200, 0, Some("payload")), (403, 22, None), (0, 7, None)]
         {
@@ -852,6 +874,7 @@ mod github_auth_tests {
                         explicit_github_token: None,
                         https_only: false,
                         revoke_best_effort: false,
+                        proxy: None,
                     },
                 };
                 fixture.script(

@@ -98,6 +98,7 @@ struct Shared {
     sink: RwLock<Option<AgentSink>>,
     known: Mutex<HashMap<String, Known>>,
     providers: RwLock<Vec<provider::ProviderSpec>>,
+    network_proxy: RwLock<Option<Arc<ide_core::proxy_settings::ProxySettings>>>,
     /// Last probe of each provider.
     probes: Mutex<HashMap<String, AgentProbe>>,
     /// One pre-session lookup of commands and settings per provider, including failed attempts.
@@ -119,9 +120,34 @@ struct Known {
     commands: HashMap<String, Vec<AgentCommand>>,
 }
 
+fn network_env(proxy: &ide_core::proxy_settings::ProxySettings) -> Vec<(String, String)> {
+    let Some(url) = proxy.proxy_url() else { return Vec::new() };
+    let mut env: Vec<_> = proxy
+        .child_env()
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value?.into_string().ok()?)))
+        .collect();
+    env.extend(
+        ["WS_PROXY", "WSS_PROXY", "ws_proxy", "wss_proxy", "npm_config_proxy", "npm_config_https_proxy"]
+            .into_iter()
+            .map(|key| (key.into(), url.clone())),
+    );
+    env
+}
+
 impl Shared {
     fn spec(&self, id: &str) -> Option<provider::ProviderSpec> {
         self.providers.read().iter().find(|p| p.id == id).cloned()
+    }
+
+    fn launch_spec(&self, id: &str) -> Option<provider::ProviderSpec> {
+        let mut spec = self.spec(id)?;
+        if let Some(proxy) = self.network_proxy.read().as_deref() {
+            let env = network_env(proxy);
+            spec.env.retain(|(key, _)| env.iter().all(|(name, _)| !name.eq_ignore_ascii_case(key)));
+            spec.env.extend(env);
+        }
+        Some(spec)
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -382,6 +408,7 @@ impl AgentManager {
             sink: RwLock::new(None),
             known: Mutex::new(known),
             providers,
+            network_proxy: RwLock::new(None),
             probes: Mutex::new(HashMap::new()),
             command_fetches: Mutex::new(HashMap::new()),
             idle_release_ms: AtomicU64::new(IDLE_RELEASE.as_millis() as u64),
@@ -412,6 +439,16 @@ impl AgentManager {
             }
         }
         Self { shared, tasks: RwLock::new(tasks) }
+    }
+
+    /// Use this proxy for agent processes started by this project.
+    pub fn set_network_proxy(&self, proxy: Option<Arc<ide_core::proxy_settings::ProxySettings>>) {
+        *self.shared.network_proxy.write() = proxy;
+        self.shared.probes.lock().clear();
+    }
+
+    pub fn network_proxy(&self) -> Option<Arc<ide_core::proxy_settings::ProxySettings>> {
+        self.shared.network_proxy.read().clone()
     }
 
     /// Routes events to `sink` (replacing the previous subscriber); returns every task.
@@ -893,7 +930,8 @@ impl AgentManager {
         if !refresh && let Some(p) = self.shared.probes.lock().get(provider) {
             return Ok(p.clone());
         }
-        let spec = self.shared.spec(provider).ok_or_else(|| IdeError::invalid(format!("unknown agent {provider}")))?;
+        let spec =
+            self.shared.launch_spec(provider).ok_or_else(|| IdeError::invalid(format!("unknown agent {provider}")))?;
         let mut probe = AgentProbe {
             provider: spec.id.clone(),
             name: None,
@@ -1507,7 +1545,7 @@ impl Task {
             let s = self.state.lock();
             (s.task.provider.clone(), s.task.cwd.0.clone(), s.session_id.clone())
         };
-        let spec = self.shared.spec(&provider_id).ok_or_else(|| format!("unknown agent {provider_id}"))?;
+        let spec = self.shared.launch_spec(&provider_id).ok_or_else(|| format!("unknown agent {provider_id}"))?;
         let launch_cwd = cwd.clone();
         let spec = tokio::task::spawn_blocking(move || spec.resolve_for_launch(&launch_cwd))
             .await

@@ -639,6 +639,7 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         crate::remote_dev::remote_bootstrap_list,
         crate::remote_dev::remote_connect,
         crate::remote_dev::remote_current,
+        crate::remote_dev::remote_agent_network,
         crate::remote_dev::remote_disconnect,
         crate::remote_dev::remote_forwarded_ports,
         crate::remote_dev::remote_forward_port,
