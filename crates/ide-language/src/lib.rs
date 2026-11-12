@@ -10,6 +10,10 @@ use specta::Type;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Pinned Compose Specification JSON Schema URL associated with `yaml-language-server`.
+pub const COMPOSE_SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/compose-spec/compose-go/v2.16.2/schema/compose-spec.json";
+
 mod markers;
 pub mod plugin_point;
 mod registry;
@@ -113,6 +117,10 @@ pub struct LanguageServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Environment variables the server can't start without (PowerShell Editor
+    /// Services' `PSES_BUNDLE_PATH`): while one is unset it counts as missing.
+    #[serde(default)]
+    pub requires_env: Vec<String>,
     /// Files whose presence marks a workspace root, e.g. `Cargo.toml`;
     /// `file#table` requires the TOML file to contain that dotted table, e.g.
     /// `pyproject.toml#tool.ruff`.

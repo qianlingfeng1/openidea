@@ -6,7 +6,7 @@ import { create } from "zustand";
 import type { ForwardedPort } from "@/bindings";
 import { tx } from "@/platform/i18n";
 import { call, commands } from "@/platform/ipc";
-import { useRemote } from "@/platform/remote";
+import { remoteLocation, useRemote } from "@/platform/remote";
 import { notifications } from "@/workbench/contributions";
 
 const SAVED_KEY = "openidea.remote.ports:";
@@ -18,6 +18,10 @@ function savedKey(): string | null {
       return `${SAVED_KEY}${session.target.config}:${session.root}`;
     case "devContainer":
       return `${SAVED_KEY}devcontainer:${JSON.stringify([session.target.folder, session.target.config])}`;
+    case "sshContainer":
+      return SAVED_KEY + remoteLocation(session.target, session.root);
+    case "sshDevContainer":
+      return SAVED_KEY + remoteLocation(session.target, "");
     default:
       return null;
   }
@@ -38,7 +42,9 @@ function save(ports: readonly ForwardedPort[]) {
   const key = savedKey();
   if (!key) return;
   try {
-    if (ports.length) localStorage.setItem(key, JSON.stringify(ports.map((p) => p.remotePort)));
+    // A port of another host comes from `forwardPorts`, which forwards it on every connection.
+    const own = ports.filter((p) => !p.host).map((p) => p.remotePort);
+    if (own.length) localStorage.setItem(key, JSON.stringify(own));
     else localStorage.removeItem(key);
   } catch {
     /* storage unavailable */
@@ -88,8 +94,9 @@ export async function forwardPort(port: number): Promise<ForwardedPort | null> {
   }
 }
 
-export async function stopForwarding(port: number): Promise<void> {
-  await call(commands.remoteStopForwarding(port)).catch(() => {});
+/** `host`: the host the port belongs to (a Compose service), null for the remote host itself. */
+export async function stopForwarding(port: number, host: string | null = null): Promise<void> {
+  await call(commands.remoteStopForwarding(port, host)).catch(() => {});
   await refreshPorts(true);
 }
 

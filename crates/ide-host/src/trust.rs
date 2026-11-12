@@ -221,6 +221,8 @@ pub fn restricted_command_allowed(cmd: &str) -> bool {
         "term_",
         "settings_",
         "project_trust_",
+        // New Project writes only where the user chose and runs no code of an open project.
+        "scaffold_",
         "ssh_",
         "git_credential",
     ]
@@ -315,6 +317,9 @@ pub fn restricted_command_allowed(cmd: &str) -> bool {
             | "remote_disconnect"
             | "remote_connect"
             | "remote_bootstrap_list"
+            | "remote_container_list"
+            | "remote_container_folders"
+            | "remote_devcontainer_configs"
             | "wsl_distros"
             | "wsl_resolve"
             | "remote_list"
@@ -335,6 +340,11 @@ pub fn restricted_command_allowed(cmd: &str) -> bool {
             | "agent_registry_list"
             | "agent_registry_install"
             | "agent_registry_remove"
+            | "agent_mcp_list"
+            | "agent_mcp_save"
+            | "agent_mcp_set_enabled"
+            | "agent_mcp_remove"
+            | "agent_mcp_import"
             | "coverage_import"
             | "system_font_families"
             | "user_font_data"

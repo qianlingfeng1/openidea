@@ -1,7 +1,9 @@
 //! Validated results of the Dev Containers CLI.
 
-use ide_core::{IdeError, IdeResult};
+use ide_core::{IdeError, IdeResult, error::ErrorKind};
+use ide_ssh::{RemoteFs, Session, sftp::join};
 use serde::Deserialize;
+use serde_json::Value;
 
 /// The container `devcontainer up` started, as it reported it.
 #[derive(Debug, PartialEq, Eq)]
@@ -23,6 +25,7 @@ struct UpResult {
     remote_workspace_folder: Option<String>,
     message: Option<String>,
     description: Option<String>,
+    merged_configuration: Option<Value>,
 }
 
 fn is_container_id(id: &str) -> bool {
@@ -43,6 +46,10 @@ fn is_container_path(path: &str) -> bool {
 
 /// Reads the result of `devcontainer up` from its stdout (the last JSON line).
 pub fn parse_up(stdout: &str) -> IdeResult<Up> {
+    parse_up_with_configuration(stdout).map(|(up, _)| up)
+}
+
+pub(crate) fn parse_up_with_configuration(stdout: &str) -> IdeResult<(Up, Option<Value>)> {
     let line = stdout.lines().rev().map(str::trim).find(|l| l.starts_with('{'));
     let result: UpResult = line
         .and_then(|l| serde_json::from_str(l).ok())
@@ -55,9 +62,39 @@ pub fn parse_up(stdout: &str) -> IdeResult<Up> {
     let user = result.remote_user.filter(|u| is_user(u));
     let folder = result.remote_workspace_folder.filter(|f| is_container_path(f));
     match (container, user, folder) {
-        (Some(container), Some(user), Some(folder)) => Ok(Up { container, user, folder }),
+        (Some(container), Some(user), Some(folder)) => {
+            Ok((Up { container, user, folder }, result.merged_configuration))
+        }
         _ => Err(IdeError::unavailable("devcontainer up reported an unexpected container, user or folder")),
     }
+}
+
+/// Configurations on the SSH host, in default-config order followed by named configs.
+pub async fn ssh_configs(session: &Session, root: &str) -> IdeResult<Vec<String>> {
+    let fs = RemoteFs::new(session.sftp().await?);
+    let result = async {
+        let mut configs = Vec::new();
+        for path in [".devcontainer/devcontainer.json", ".devcontainer.json"] {
+            if fs.stat(&join(root, path)).await?.is_some_and(|entry| !entry.is_dir) {
+                configs.push(path.to_owned());
+            }
+        }
+        let base = join(root, ".devcontainer");
+        let entries = match fs.list(&base).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind == ErrorKind::NotFound => return Ok(configs),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.into_iter().filter(|entry| entry.is_dir && !entry.name.chars().any(char::is_control)) {
+            if fs.stat(&join(&entry.path, "devcontainer.json")).await?.is_some_and(|entry| !entry.is_dir) {
+                configs.push(format!(".devcontainer/{}/devcontainer.json", entry.name));
+            }
+        }
+        Ok(configs)
+    }
+    .await;
+    fs.close().await;
+    result
 }
 
 #[cfg(test)]

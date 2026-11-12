@@ -5,6 +5,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import type { InstallEvent, RequestId, ToolInfo } from "@/bindings";
 import { call, commands, IpcError, isTauri } from "@/platform/ipc";
+import { invokeLocal } from "@/platform/tauriCore";
 
 export interface LanguageChoice {
   id: string;
@@ -16,7 +17,7 @@ export interface ToolsBackend {
   install(name: string, request: RequestId, onEvent: (e: InstallEvent) => void): Promise<ToolInfo>;
   uninstall(name: string): Promise<ToolInfo>;
   cancel(request: RequestId): void;
-  /** Restarts running language servers named `name` (after an install). */
+  /** Restarts the language servers named `name` in every open project (after an install). */
   restartServers(name: string): Promise<void>;
   /** File chooser for an executable; null when cancelled. */
   chooseExecutable(title: string, defaultPath?: string): Promise<string | null>;
@@ -33,25 +34,22 @@ export const tauriToolsBackend: ToolsBackend = {
   },
   uninstall: (name) => call(commands.toolsUninstall(name)),
   cancel: (request) => void commands.cancelRequest(request).catch(() => {}),
+  // Every open project: Settings belongs to one project window, but all of them run the tool.
   restartServers: async (name) => {
-    let servers;
-    try {
-      servers = await call(commands.lspServers());
-    } catch {
-      return; // no project open
-    }
-    await Promise.all(
-      servers.filter((s) => s.name === name).map((s) => call(commands.lspRestart(s.id)).catch(() => {})),
-    );
+    await call(commands.lspRestartNamed(name));
   },
   chooseExecutable: async (title, defaultPath) => {
-    const { open } = await import("@tauri-apps/plugin-dialog");
+    const { open } = await import("@/platform/dialog");
     const picked = await open({ directory: false, multiple: false, title, defaultPath: defaultPath || undefined });
     return (Array.isArray(picked) ? picked[0] : picked) ?? null;
   },
   languages: async () =>
     (await commands.languages()).map((l) => ({ id: l.id, name: l.name })).sort((a, b) => a.name.localeCompare(b.name)),
 };
+
+export function listLocalTools(): Promise<ToolInfo[]> {
+  return invokeLocal<ToolInfo[]>("tools_list");
+}
 
 function tool(partial: Partial<ToolInfo> & Pick<ToolInfo, "name" | "languages">): ToolInfo {
   return {

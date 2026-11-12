@@ -10,6 +10,7 @@ mod angular;
 mod arduino;
 mod caps;
 mod clang_tidy;
+mod compose;
 mod convert;
 mod external_project;
 mod file_ops;
@@ -35,6 +36,7 @@ mod virtual_doc;
 
 pub use injections::{InjectedRange, InjectionProvider, MAX_INJECTED_DOCUMENT_BYTES};
 pub use inspect::{FileInspection, InspectHost, InspectOptions};
+pub use jdtls::jvm_inspect::JdtJvmInspector;
 pub use launch::{LaunchError, Launcher, ProcessLauncher};
 pub use scope::{CandidateFiles, CandidateFn, CandidateQuery, MAX_CANDIDATES};
 pub use uri::{is_virtual_uri, path_to_uri_string, uri_target, uri_to_path};
@@ -107,6 +109,8 @@ struct DocState {
     version: i32,
     text: Arc<DocText>,
     servers: Vec<Attached>,
+    /// Open YAML document whose filename does not match a Compose glob and whose content is Compose.
+    compose_detected: bool,
 }
 
 impl DocState {
@@ -209,6 +213,8 @@ pub struct LspManager {
     shutting_down: AtomicBool,
     execution_allowed: AtomicBool,
     java_usages_warned: AtomicBool,
+    /// java-debug DAP port → the module path whose jdtls serves it.
+    debug_servers: Mutex<HashMap<u16, PathBuf>>,
     configuration_cache: Arc<Mutex<jdtls::configuration::ConfigurationCache>>,
     /// `window/showMessage` texts already surfaced; servers repeat them on every restart/reconfigure.
     shown_messages: Mutex<HashSet<(String, String)>>,
@@ -417,6 +423,7 @@ impl LspManager {
             shutting_down: AtomicBool::new(false),
             execution_allowed: AtomicBool::new(true),
             java_usages_warned: AtomicBool::new(false),
+            debug_servers: Mutex::new(HashMap::new()),
             configuration_cache: Arc::new(Mutex::new(Default::default())),
             shown_messages: Mutex::new(HashSet::new()),
             virtual_origins: Mutex::new(HashMap::new()),
@@ -1017,6 +1024,7 @@ impl LspManager {
         servers: Vec<Arc<Server>>,
     ) {
         let canonical = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let compose_detected = language.as_str() == "yaml" && compose::is_content_detected_compose_file(&path, text);
         let mut state = DocState {
             path,
             canonical,
@@ -1025,9 +1033,12 @@ impl LspManager {
             version: version as i32,
             text: Arc::new(DocText::new(text)),
             servers: servers.iter().map(|s| Attached { server: s.clone(), opened_gen: None }).collect(),
+            compose_detected,
         };
-        {
+        let compose_added = {
             let mut docs = self.docs.lock();
+            let already_detected =
+                compose_detected && docs.values().any(|d| d.compose_detected && d.path == state.path);
             let params = state.did_open_params();
             for a in &mut state.servers {
                 if let Some(run) = a.server.running() {
@@ -1038,13 +1049,17 @@ impl LspManager {
                 }
             }
             docs.insert(doc, state);
-        }
+            compose_detected && !already_detected
+        };
         self.schedule_pull(doc, None, Duration::ZERO);
         for s in &servers {
             self.ensure_started(s);
             if s.running().is_some()
                 && let Some(me) = self.me.upgrade()
             {
+                if s.name == compose::SERVER && compose_added {
+                    me.reconfigure_soon();
+                }
                 let server = s.clone();
                 self.runtime.spawn(async move { me.check_clang_tidy(&server).await });
             }
@@ -1115,7 +1130,18 @@ impl LspManager {
                 tracing::debug!("{}: didChange: {e}", server.name);
             }
         }
+        let compose_changed = if d.language.as_str() == "yaml" && !compose::is_named_compose_file(&d.path) {
+            let now = compose::is_compose_content(text.as_str());
+            let changed = std::mem::replace(&mut d.compose_detected, now) != now;
+            let closed_path = d.path.clone();
+            changed && !docs.iter().any(|(id, other)| *id != doc && other.compose_detected && other.path == closed_path)
+        } else {
+            false
+        };
         drop(docs);
+        if compose_changed && let Some(me) = self.me.upgrade() {
+            me.reconfigure_soon();
+        }
         self.schedule_pull(doc, None, pull::AFTER_EDIT);
         self.invalidate_injections(doc);
         self.schedule_injections(doc);
@@ -1175,7 +1201,16 @@ impl LspManager {
     }
 
     fn close_document(&self, doc: DocId) {
-        let Some(d) = self.docs.lock().remove(&doc) else { return };
+        let (d, compose_removed) = {
+            let mut docs = self.docs.lock();
+            let Some(d) = docs.remove(&doc) else { return };
+            let removed =
+                d.compose_detected && !docs.values().any(|other| other.compose_detected && other.path == d.path);
+            (d, removed)
+        };
+        if compose_removed && let Some(me) = self.me.upgrade() {
+            me.reconfigure_soon();
+        }
         for a in &d.servers {
             self.forget_pulled(&a.server, &d.path, a.server.running().as_ref());
             let Some(run) = a.server.running() else { continue };
@@ -3169,7 +3204,18 @@ impl LspManager {
         if let Some(hook) = self.config_hook.read().clone() {
             hook(&mut cfg, &server.root);
         }
+        if cfg.name == compose::SERVER {
+            compose::configure_yaml_compose_schemas(&mut cfg, &self.open_compose_files());
+        }
         cfg
+    }
+
+    fn open_compose_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> =
+            self.docs.lock().values().filter(|d| d.compose_detected).map(|d| d.path.clone()).collect();
+        files.sort();
+        files.dedup();
+        files
     }
 
     /// Restarts running servers whose settings-derived configuration changed

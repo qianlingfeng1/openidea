@@ -256,6 +256,7 @@ describe("catalogs", () => {
   /** Product names intentionally kept as written in every locale. */
   const SAME_AS_ENGLISH = new Set([
     "Docker",
+    "JUnit",
     "⌘Enter",
     "Fork",
     "Shell",
@@ -282,6 +283,7 @@ describe("catalogs", () => {
     "Yarn",
     "Cargo",
     "CMake",
+    "Tailwind CSS",
   ]);
   const translated = SUPPORTED_LOCALES.filter((locale) => locale !== "en").sort();
 

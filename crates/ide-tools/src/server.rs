@@ -7,7 +7,14 @@ use ide_core::CancellationToken;
 use ide_core::{IdeError, IdeResult};
 use std::path::{Path, PathBuf};
 
-const RELEASES: &str = "https://github.com/l0ng-ai/openidea/releases/download";
+const RELEASES: &str = match option_env!("OPENIDEA_SERVER_RELEASES_URL") {
+    Some(url) => url,
+    None => "https://github.com/l0ng-ai/openidea/releases/download",
+};
+const TAG_PREFIX: &str = match option_env!("OPENIDEA_SERVER_RELEASE_TAG_PREFIX") {
+    Some(prefix) => prefix,
+    None => "v",
+};
 
 /// Host platforms with a published server (Rust's `OS`-`ARCH` names).
 pub const PLATFORMS: &[(&str, &str)] =
@@ -41,7 +48,7 @@ pub fn fetch(
         return Err(IdeError::unavailable(format!("remote development does not support {os}-{arch} hosts")));
     }
     let name = asset_name(os, arch);
-    let url = format!("{RELEASES}/v{version}/{name}");
+    let url = format!("{RELEASES}/{TAG_PREFIX}{version}/{name}");
     let dir = dest.parent().expect("cached path has a parent");
     std::fs::create_dir_all(dir)?;
     let staging = tempfile_dir(dir)?;
