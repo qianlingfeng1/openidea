@@ -8,6 +8,7 @@ import {
   recentRemotes,
   rememberRemote,
   remoteLocation,
+  sameTarget,
 } from "@/platform/remote";
 import { browsableFolders, listedDirectory, remoteParent } from "./model";
 import { remoteBadge } from "./RemoteStatus";
@@ -79,6 +80,41 @@ describe("remote project locations", () => {
       target,
       path: "/workspaces/app",
     });
+  });
+
+  it("keys SSH containers by their full ID and Docker daemon", () => {
+    const target = {
+      kind: "sshContainer",
+      config: "my host",
+      daemon: "engine-a",
+      container: "a".repeat(64),
+    } as const;
+    const path = "/workspaces/my app";
+    expect(parseRemoteLocation(remoteLocation(target, path))).toEqual({ target, path });
+    expect(sameTarget(target, { ...target, daemon: "engine-b" })).toBe(false);
+    expect(sameTarget(target, { ...target, container: "a".repeat(63) + "b" })).toBe(false);
+    expect(parseRemoteLocation("ssh-container://%/bad")).toBeNull();
+  });
+
+  it("restores a managed SSH container by source project and config", () => {
+    const target = {
+      kind: "sshDevContainer",
+      config: "my host",
+      folder: "/srv/my project",
+      file: ".devcontainer/web/devcontainer.json",
+    } as const;
+    const path = "/workspaces/app";
+    expect(parseRemoteLocation(remoteLocation(target, path))).toEqual({ target, path });
+    const legacy = encodeURIComponent(
+      JSON.stringify(["openidea.dev-containers/reopen", target.config, target.folder, target.file]),
+    );
+    expect(parseRemoteLocation(`ssh-devcontainer://${legacy}${path}`)).toEqual({ target, path });
+    expect(sameTarget(target, { ...target, file: ".devcontainer.json" })).toBe(false);
+    localStorage.clear();
+    const recent = { target, name: "app", host: "dev-box", openedAtMs: 1 };
+    rememberRemote({ ...recent, path });
+    rememberRemote({ ...recent, path: "/workspace/new-app", openedAtMs: 2 });
+    expect(recentRemotes().map((entry) => entry.path)).toEqual(["/workspace/new-app"]);
   });
 
   it("remembers recent remote projects most recent first, once each", () => {

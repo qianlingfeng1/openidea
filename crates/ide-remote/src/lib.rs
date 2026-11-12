@@ -8,6 +8,7 @@ pub mod docker;
 pub mod import;
 pub mod mapping;
 pub mod service;
+pub mod ssh_container;
 pub mod target;
 
 pub use deploy::{

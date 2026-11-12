@@ -1,6 +1,7 @@
 //! Loopback port forwards carried through a container's stdin/stdout relay.
 
 use crate::devcontainer::Up;
+use crate::ssh_container::DockerOverSsh;
 use ide_core::{CancellationToken, IdeResult};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -9,24 +10,20 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How to run the installed server in a started container (forwarded connections).
-pub struct Exec {
-    docker: PathBuf,
-    up: Up,
-    bin: String,
+pub enum Exec {
+    Local { docker: PathBuf, up: Up, bin: String },
+    Ssh { docker: DockerOverSsh, container: String, user: Option<String>, bin: String },
 }
 
 impl Exec {
     pub fn new(docker: PathBuf, up: Up, bin: String) -> Self {
-        Self { docker, up, bin }
+        Self::Local { docker, up, bin }
     }
+}
 
-    /// The arguments of `docker` for one connection from the container to `<host>:<port>`.
-    fn connect_args(&self, host: &str, port: u16) -> Vec<String> {
-        let port = port.to_string();
-        ["exec", "-i", "-u", &self.up.user, &self.up.container, &self.bin, "--connect", host, &port]
-            .map(str::to_owned)
-            .into()
-    }
+fn connect_args(up: &Up, bin: &str, host: &str, port: u16) -> Vec<String> {
+    let port = port.to_string();
+    ["exec", "-i", "-u", &up.user, &up.container, bin, "--connect", host, &port].map(str::to_owned).into()
 }
 
 /// A forwarded port of the container; dropping it closes its listener and connections.
@@ -97,9 +94,30 @@ async fn forward(
     port: u16,
     cancel: CancellationToken,
 ) {
-    let mut cmd = tokio::process::Command::new(&exec.docker);
+    let (docker, up, bin) = match &*exec {
+        Exec::Local { docker, up, bin } => (docker, up, bin),
+        Exec::Ssh { docker, container, user, bin } => {
+            let remote = port.to_string();
+            let relay = async {
+                let mut stream =
+                    docker.stream_in(container, user.as_deref(), &[bin, "--connect", &host, &remote]).await?;
+                tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
+                Ok::<_, ide_core::IdeError>(())
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                result = relay => {
+                    if let Err(error) = result {
+                        tracing::warn!("forwarding {host}:{port}: {error}");
+                    }
+                }
+            }
+            return;
+        }
+    };
+    let mut cmd = tokio::process::Command::new(docker);
     ide_core::process::prepare(cmd.as_std_mut());
-    cmd.args(exec.connect_args(&host, port))
+    cmd.args(connect_args(up, bin, &host, port))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -178,13 +196,13 @@ mod tests {
     #[test]
     fn a_forwarded_connection_runs_the_server_as_a_relay() {
         let up = Up { container: ID.into(), user: "vscode".into(), folder: "/w".into() };
-        let exec = Exec { docker: "docker".into(), up, bin: "/s/openidea-server".into() };
+        let bin = "/s/openidea-server";
         assert_eq!(
-            exec.connect_args("localhost", 8000),
+            connect_args(&up, bin, "localhost", 8000),
             ["exec", "-i", "-u", "vscode", ID, "/s/openidea-server", "--connect", "localhost", "8000"]
         );
         assert_eq!(
-            exec.connect_args("selenium", 4444),
+            connect_args(&up, bin, "selenium", 4444),
             ["exec", "-i", "-u", "vscode", ID, "/s/openidea-server", "--connect", "selenium", "4444"]
         );
     }
@@ -200,7 +218,7 @@ mod tests {
         std::fs::write(&docker, "#!/bin/sh\necho \"$*\"\nexec cat\n").unwrap();
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let up = Up { container: ID.into(), user: "root".into(), folder: "/w".into() };
-        let exec = Arc::new(Exec { docker, up, bin: "/s/openidea-server".into() });
+        let exec = Arc::new(Exec::new(docker, up, "/s/openidea-server".into()));
         let tunnel = Tunnel::listen(exec, 0, "localhost", 8000).await.unwrap();
         for _ in 0..2 {
             let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", tunnel.port())).await.unwrap();

@@ -9,12 +9,13 @@
 //! `openidea-server --connect localhost <port>` in the container and pipes through it: the
 //! container's own network is reached the same way on every Docker setup.
 
-use crate::remote_dev::{Progress, RemoteStage, SERVER_BIN};
+use crate::remote_dev::{ForwardKey, Progress, RemoteRequest, RemoteStage, SERVER_BIN};
 use crate::remote_wsl::{Probe, Tail, install_script, parse_probe, probe_script, upload, version_dir};
 use ide_core::{IdeError, IdeResult};
 use ide_jsonrpc::{Handler, Peer};
 use ide_remote::container_tunnel::Exec;
 use ide_remote::devcontainer::{Up, parse_up};
+use ide_remote::ssh_container::DockerOverSsh;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -225,6 +226,99 @@ fn spawn(docker: &Path, up: &Up, bin: &str, handler: Arc<dyn Handler>, tail: &Ta
     let program = docker.to_string_lossy();
     Peer::spawn(&program, &server_args(up, bin), &std::env::temp_dir(), &[], handler, Box::new(move |l| tail.push(l)))
         .map_err(|e| IdeError::unavailable(format!("cannot start docker: {e}")))
+}
+
+/// Attaches to an existing container using its configured user and a byte stream over SSH.
+pub(crate) async fn attach_ssh(
+    state: &crate::state::AppState,
+    docker: DockerOverSsh,
+    id: &str,
+    path: &str,
+    handler: Arc<dyn Handler>,
+    request: &RemoteRequest<'_>,
+    progress: &Arc<Progress>,
+) -> IdeResult<(Peer, String, String, Exec)> {
+    progress(RemoteStage::Checking, None);
+    let info = request.run(docker.inspect(id)).await?;
+    let root = request.run(docker.resolve_directory(id, path)).await?;
+    let (bin, home) = ensure_ssh_server(state, &docker, id, None, request, progress).await?;
+    progress(RemoteStage::Starting, None);
+    let server_home = ssh_server_home(&home, id);
+    let lifecycle = format!("{}=1", ide_host::environment::LIFECYCLE_DONE_ENV);
+    let args = ["exec", "-i", "-w", &root, "-e", &server_home, "-e", &lifecycle, id, &bin, "--stdio"];
+    let stream = request.run(docker.stream(&args)).await?;
+    let (reader, writer) = tokio::io::split(stream);
+    let peer = Peer::connect(reader, writer, handler);
+    Ok((peer, root, info.name().to_owned(), Exec::Ssh { docker, container: id.to_owned(), user: None, bin }))
+}
+
+pub(crate) async fn reopen_ssh(
+    state: &crate::state::AppState,
+    docker: DockerOverSsh,
+    source: (&str, &str),
+    handler: Arc<dyn Handler>,
+    request: &RemoteRequest<'_>,
+    progress: &Arc<Progress>,
+) -> IdeResult<(Peer, String, Exec, Vec<ForwardKey>)> {
+    let (root, config) = source;
+    progress(RemoteStage::Container, None);
+    let (up, merged) = docker.devcontainer_up(root, config, &request.cancel).await?;
+    progress(RemoteStage::Checking, None);
+    request.run(docker.inspect(&up.container)).await?;
+    let (bin, home) = ensure_ssh_server(state, &docker, &up.container, Some(&up.user), request, progress).await?;
+    progress(RemoteStage::Starting, None);
+    let env = [
+        ssh_server_home(&home, &up.container),
+        format!("{}={}", ide_host::trust::TRUSTED_ROOT_ENV, up.folder),
+        format!("{}=1", ide_host::environment::SKIP_DEVCONTAINER_ENV),
+    ];
+    let stream = request.run(docker.devcontainer_stream(root, config, &up, &bin, &env)).await?;
+    let (reader, writer) = tokio::io::split(stream);
+    let peer = Peer::connect(reader, writer, handler);
+    let forwards = ide_workspace::devcontainer::forward_ports(merged.as_ref().and_then(|v| v.get("forwardPorts")));
+    Ok((peer, up.folder, Exec::Ssh { docker, container: up.container, user: Some(up.user), bin }, forwards))
+}
+
+fn ssh_server_home(home: &str, id: &str) -> String {
+    format!("OPENIDEA_SERVER_HOME={}/.openidea/ssh-containers/{id}", home.trim_end_matches('/'))
+}
+
+async fn ensure_ssh_server(
+    state: &crate::state::AppState,
+    docker: &DockerOverSsh,
+    id: &str,
+    user: Option<&str>,
+    request: &RemoteRequest<'_>,
+    progress: &Arc<Progress>,
+) -> IdeResult<(String, String)> {
+    use crate::remote_dev::{LocalServer, local_server, platform};
+    let version = env!("CARGO_PKG_VERSION");
+    let script = probe_script();
+    let probe = parse_probe(
+        &request
+            .run(docker.capture_in(id, user, &["sh", "-c", &script, "sh", version], "probing the container"))
+            .await?,
+    )?;
+    let (os, arch) = platform(&probe.uname);
+    if os != "linux" {
+        return Err(IdeError::unavailable("The selected container must run Linux"));
+    }
+    let bin = match request.run(local_server(state, version, &os, &arch, &probe.installed, progress.clone())).await? {
+        LocalServer::Installed(bin) => bin,
+        LocalServer::Binary(local, build) => {
+            let bin = format!("{}/{build}/{SERVER_BIN}", version_dir(&probe.home, version));
+            if !probe.installed.contains(&bin) {
+                progress(RemoteStage::Uploading, Some(0.0));
+                let data = request.run(async { Ok(tokio::fs::read(local).await?) }).await?;
+                docker
+                    .install(id, user, &bin, &data, &request.cancel, &|f| progress(RemoteStage::Uploading, Some(f)))
+                    .await?;
+            }
+            bin
+        }
+    };
+    request.run(docker.capture_in(id, user, &[&bin, "--version"], "checking openidea-server in the container")).await?;
+    Ok((bin, probe.home))
 }
 
 #[cfg(test)]

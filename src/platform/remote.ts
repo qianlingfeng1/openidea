@@ -13,10 +13,12 @@ import {
   commands,
   IpcError,
   isTauri,
+  nextRequestId,
   type ChannelFrame,
   type RemoteProgress,
   type RemoteSession,
   type RemoteTarget,
+  type RequestId,
 } from "./ipc";
 import { isClientSetting, overlayClientSettings } from "./clientSettings";
 import type { Settings } from "./ipc";
@@ -154,11 +156,27 @@ export const useRemoteProgress = create<{ progress: RemoteProgress | null; locat
   location: null,
 }));
 
+let connectingRequest: RequestId | null = null;
+
+/** Bootstrap commands run on this desktop, even when this window already has a remote server. */
+export function cancelRemoteRequest(id: RequestId) {
+  return invokeLocal("cancel_request", { id }).catch(() => {});
+}
+
+export function cancelRemoteConnection() {
+  if (connectingRequest !== null) void cancelRemoteRequest(connectingRequest);
+}
+
 /**
  * Opens `path` of `target` (an SSH host or a WSL distribution) in this window. A dev container's
  * project folder is the one in the container: `path` is then only a label.
  */
 export async function connectRemote(target: RemoteTarget, path: string) {
+  if (connectingRequest !== null) {
+    throw new IpcError({ kind: "cancelled", message: "A remote connection is already in progress" });
+  }
+  const request = nextRequestId();
+  connectingRequest = request;
   useProject.setState({ opening: true });
   const location = remoteLocation(target, path);
   const onProgress = new Channel<RemoteProgress>();
@@ -172,10 +190,16 @@ export async function connectRemote(target: RemoteTarget, path: string) {
     location,
   });
   try {
-    const r = await call(commands.remoteConnect(target, path, onProgress));
+    const r = await call(commands.remoteConnect(target, path, request, onProgress));
     if (useRemoteProgress.getState().location !== location) {
       await commands.remoteDisconnect().catch(() => {});
       throw new IpcError({ kind: "cancelled", message: "Remote connection cancelled" });
+    }
+    // A bind mount can give the container and SSH project identical paths. Reset
+    // project-scoped stores even though the root string stayed the same.
+    if (target.kind === "sshDevContainer" && useProject.getState().project?.root === r.root) {
+      disableRemote();
+      useProject.setState({ project: null });
     }
     enableRemote({ target: r.target, root: r.root, host: r.host, os: r.os, commands: r.commands });
     if (takeLegacyRemoteTrust(r.target, path, r.host)) {
@@ -202,6 +226,7 @@ export async function connectRemote(target: RemoteTarget, path: string) {
     });
     return r;
   } finally {
+    connectingRequest = null;
     if (useRemoteProgress.getState().location === location) {
       useProject.setState({ opening: false });
       useRemoteProgress.setState({ progress: null, location: null });
@@ -221,7 +246,13 @@ export async function disconnectRemote() {
 // `wsl://<distribution>/<absolute path>` or `devcontainer://<local folder>[:<config>]/<container path>`,
 // what the session and the recent projects remember for a remote window.
 
-const SCHEMES = { ssh: "ssh://", wsl: "wsl://", devContainer: "devcontainer://" } as const;
+const SCHEMES = {
+  ssh: "ssh://",
+  wsl: "wsl://",
+  devContainer: "devcontainer://",
+  sshContainer: "ssh-container://",
+  sshDevContainer: "ssh-devcontainer://",
+} as const;
 
 /** The SSH configuration id, the WSL distribution name or the dev container's local folder. */
 export function targetName(target: RemoteTarget): string {
@@ -232,20 +263,30 @@ export function targetName(target: RemoteTarget): string {
       return target.distro;
     case "devContainer":
       return target.folder;
+    case "sshContainer":
+      return `${target.container.slice(0, 12)} @ ${target.config}`;
+    case "sshDevContainer":
+      return target.folder.split("/").filter(Boolean).at(-1) ?? target.config;
   }
 }
 
 export function sameTarget(a: RemoteTarget, b: RemoteTarget): boolean {
-  return (
-    a.kind === b.kind &&
-    targetName(a) === targetName(b) &&
-    (a.kind !== "devContainer" || b.kind !== "devContainer" || a.config === b.config)
-  );
+  return a.kind === b.kind && targetAuthority(a) === targetAuthority(b);
+}
+
+function targetAuthority(target: RemoteTarget): string {
+  if (target.kind === "sshContainer") {
+    return encodeURIComponent(JSON.stringify([target.config, target.daemon, target.container]));
+  }
+  if (target.kind === "sshDevContainer") {
+    return encodeURIComponent(JSON.stringify([target.config, target.folder, target.file]));
+  }
+  const config = target.kind === "devContainer" && target.config ? `:${encodeURIComponent(target.config)}` : "";
+  return encodeURIComponent(targetName(target)) + config;
 }
 
 export function remoteLocation(target: RemoteTarget, path: string): string {
-  const config = target.kind === "devContainer" && target.config ? `:${encodeURIComponent(target.config)}` : "";
-  return `${SCHEMES[target.kind]}${encodeURIComponent(targetName(target))}${config}${path.startsWith("/") ? "" : "/"}${path}`;
+  return `${SCHEMES[target.kind]}${targetAuthority(target)}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 
 export function parseRemoteLocation(location: string): { target: RemoteTarget; path: string } | null {
@@ -255,12 +296,31 @@ export function parseRemoteLocation(location: string): { target: RemoteTarget; p
   const slash = rest.indexOf("/");
   if (slash <= 0) return null;
   const authority = rest.slice(0, slash);
+  const path = rest.slice(slash);
+  if (kind === "sshContainer" || kind === "sshDevContainer") {
+    try {
+      const fields: unknown = JSON.parse(decodeURIComponent(authority));
+      if (
+        !Array.isArray(fields) ||
+        (fields.length !== 3 && fields.length !== 4) ||
+        fields.some((field) => typeof field !== "string" || !field)
+      )
+        return null;
+      // Locations from the plugin version stored its provider ID first.
+      const [config, source, value] = fields.slice(-3) as [string, string, string];
+      if (kind === "sshDevContainer")
+        return source.startsWith("/") ? { target: { kind, config, folder: source, file: value }, path } : null;
+      return /^[a-f0-9]{64}$/.test(value) ? { target: { kind, config, daemon: source, container: value }, path } : null;
+    } catch {
+      return null;
+    }
+  }
   const colon = kind === "devContainer" ? authority.indexOf(":") : -1;
   const name = decodeURIComponent(colon < 0 ? authority : authority.slice(0, colon));
   const config = colon < 0 ? "" : decodeURIComponent(authority.slice(colon + 1));
   const target: RemoteTarget =
     kind === "ssh" ? { kind, config: name } : kind === "wsl" ? { kind, distro: name } : { kind, folder: name, config };
-  return { target, path: rest.slice(slash) };
+  return { target, path };
 }
 
 /**
@@ -346,7 +406,7 @@ function saveRemotes(list: RecentRemote[]) {
 }
 
 const sameRemote = (a: Pick<RecentRemote, "target" | "path">, b: Pick<RecentRemote, "target" | "path">) =>
-  sameTarget(a.target, b.target) && a.path === b.path;
+  sameTarget(a.target, b.target) && (a.target.kind === "sshDevContainer" || a.path === b.path);
 
 export function rememberRemote(entry: RecentRemote) {
   saveRemotes([entry, ...recentRemotes().filter((r) => !sameRemote(r, entry))]);

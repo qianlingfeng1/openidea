@@ -6,7 +6,7 @@ import { create } from "zustand";
 import type { ForwardedPort } from "@/bindings";
 import { tx } from "@/platform/i18n";
 import { call, commands } from "@/platform/ipc";
-import { useRemote } from "@/platform/remote";
+import { remoteLocation, useRemote } from "@/platform/remote";
 import { notifications } from "@/workbench/contributions";
 
 const SAVED_KEY = "openidea.remote.ports:";
@@ -18,6 +18,10 @@ function savedKey(): string | null {
       return `${SAVED_KEY}${session.target.config}:${session.root}`;
     case "devContainer":
       return `${SAVED_KEY}devcontainer:${JSON.stringify([session.target.folder, session.target.config])}`;
+    case "sshContainer":
+      return SAVED_KEY + remoteLocation(session.target, session.root);
+    case "sshDevContainer":
+      return SAVED_KEY + remoteLocation(session.target, "");
     default:
       return null;
   }

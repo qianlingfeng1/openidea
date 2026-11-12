@@ -26,6 +26,9 @@ type Changes = Vec<(OsString, Option<OsString>)>;
 /// (`devcontainer up`): the server then doesn't run `postStartCommand` again.
 pub const LIFECYCLE_DONE_ENV: &str = "OPENIDEA_LIFECYCLE_DONE";
 
+/// The desktop leaves devcontainer configuration to the CLI for managed SSH workspaces.
+pub const SKIP_DEVCONTAINER_ENV: &str = "OPENIDEA_SKIP_DEVCONTAINER_ENV";
+
 /// What Reload Environment changed.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
