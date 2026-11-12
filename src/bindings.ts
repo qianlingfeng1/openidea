@@ -1533,12 +1533,16 @@ export const commands = {
 	remoteRename: (connection: FsConnection, from: string, to: string) => typedError<null, IdeError>(__TAURI_INVOKE("remote_rename", { connection, from, to })),
 	/**  Browse before connecting, using the desktop's SSH configuration even in a remote window. */
 	remoteBootstrapList: (ssh: string, path: string) => typedError<RemoteEntry[], IdeError>(__TAURI_INVOKE("remote_bootstrap_list", { ssh, path })),
+	remoteContainerList: (config: string, request: RequestId) => typedError<SshContainers, IdeError>(__TAURI_INVOKE("remote_container_list", { config, request })),
+	remoteContainerFolders: (target: RemoteTarget, path: string | null, request: RequestId) => typedError<ContainerFolders, IdeError>(__TAURI_INVOKE("remote_container_folders", { target, path, request })),
+	/**  The configuration picker always reads the project of the current SSH window. */
+	remoteDevcontainerConfigs: (request: RequestId) => typedError<string[], IdeError>(__TAURI_INVOKE("remote_devcontainer_configs", { request })),
 	/**
 	 *  File › Remote Development: opens `path` on `target` (an SSH host, a WSL distribution, or a
 	 *  dev container, whose project folder is the container's own) in this window (installs /
 	 *  starts the server as needed).
 	 */
-	remoteConnect: (target: RemoteTarget, path: string, onProgress: Channel<RemoteProgress>) => typedError<RemoteProject_Serialize, IdeError>(__TAURI_INVOKE("remote_connect", { target, path, onProgress })),
+	remoteConnect: (target: RemoteTarget, path: string, request: RequestId, onProgress: Channel<RemoteProgress>) => typedError<RemoteProject_Serialize, IdeError>(__TAURI_INVOKE("remote_connect", { target, path, request, onProgress })),
 	/**  The remote session of this window (a settings window: its parent's), if any. */
 	remoteCurrent: () => __TAURI_INVOKE<{
 	target: RemoteTarget,
@@ -3032,6 +3036,12 @@ export type ConsoleSettings = {
 	encoding?: string,
 	/**  Consecutive lines containing any of these are folded. */
 	foldPatterns?: string[],
+};
+
+export type ContainerFolders = {
+	directory: string,
+	folders: string[],
+	user: string,
 };
 
 export type ContainerOp = "start" | "stop" | "restart" | "pause" | "unpause" | "kill";
@@ -8104,7 +8114,11 @@ export type RemoteTarget =
  *  The dev container of local folder `folder`, built and started with the Dev Containers CLI;
  *  `config` is its `devcontainer.json`, relative to the folder (empty = the default one).
  */
-{ kind: "devContainer"; folder: string; config: string };
+{ kind: "devContainer"; folder: string; config: string } | 
+/**  A running container on the Docker daemon reached via an SSH configuration. */
+{ kind: "sshContainer"; config: string; daemon: string; container: string } | 
+/**  The container managed by a configuration file of a project on the SSH host. */
+{ kind: "sshDevContainer"; config: string; folder: string; file: string };
 
 export type Renamed = {
 	/**  Indexed names always require preview, including a single-file rename. */
@@ -8949,6 +8963,11 @@ export type SshConfiguration = {
 	keyFile?: string,
 	/**  Keep the password / key passphrase in the saved passwords. */
 	saveSecret?: boolean,
+};
+
+export type SshContainers = {
+	daemon: string,
+	containers: DockerContainer[],
 };
 
 /**  Tools › SSH Configurations. */
