@@ -2,23 +2,36 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { emitLocalIdeEvent, type IdeEvent, type RemoteEntry, type Settings } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
-import { useRemoteProgress } from "@/platform/remote";
+import { useRemote, useRemoteProgress } from "@/platform/remote";
 import { ConnectHost } from "./ConnectDialog";
 import { closeConnectDialog, openConnectDialog, useConnectDialog } from "./model";
 
-const { list, distros, globalSettings, openRemote, executeAction } = vi.hoisted(() => ({
-  list: vi.fn(),
-  distros: vi.fn(),
-  globalSettings: vi.fn(),
-  openRemote: vi.fn(),
-  executeAction: vi.fn(),
-}));
+const { list, containers, folders, devConfigs, distros, globalSettings, openRemote, executeAction } = vi.hoisted(
+  () => ({
+    list: vi.fn(),
+    containers: vi.fn(),
+    folders: vi.fn(),
+    devConfigs: vi.fn(),
+    distros: vi.fn(),
+    globalSettings: vi.fn(),
+    openRemote: vi.fn(),
+    executeAction: vi.fn(),
+  }),
+);
 
 vi.mock("@/platform/ipc", async (importOriginal) => {
   const real = await importOriginal<typeof import("@/platform/ipc")>();
   return {
     ...real,
-    commands: { ...real.commands, remoteBootstrapList: list, wslDistros: distros, settingsGetGlobal: globalSettings },
+    commands: {
+      ...real.commands,
+      remoteBootstrapList: list,
+      remoteContainerList: containers,
+      remoteContainerFolders: folders,
+      remoteDevcontainerConfigs: devConfigs,
+      wslDistros: distros,
+      settingsGetGlobal: globalSettings,
+    },
   };
 });
 vi.mock("@/workbench/projectWindow", () => ({ openRemoteProject: openRemote }));
@@ -54,7 +67,10 @@ beforeEach(() => {
   openConnectDialog();
 });
 
-afterEach(() => closeConnectDialog());
+afterEach(() => {
+  closeConnectDialog();
+  useRemote.setState({ session: null });
+});
 
 it("browses the selected SSH host, navigates folders and opens one without a current project", async () => {
   let finish!: (result: { status: "ok"; data: RemoteEntry[] }) => void;
@@ -152,4 +168,67 @@ it("opens a folder of the chosen WSL distribution, without browsing over SFTP", 
   fireEvent.click(screen.getByRole("button", { name: "Open" }));
   await waitFor(() => expect(openRemote).toHaveBeenCalledWith({ kind: "wsl", distro: installed[1] }, "~"));
   expect(list).not.toHaveBeenCalled();
+});
+
+it("offers a built-in action for connecting to a running container", async () => {
+  render(<ConnectHost />);
+  fireEvent.click(await screen.findByRole("button", { name: "Connect to Running Container…" }));
+  expect(executeAction).toHaveBeenCalledWith("remote.attachContainer");
+});
+
+it("opens a directory of the full container ID on the existing SSH connection", async () => {
+  const id = "ab".repeat(32);
+  const target = { kind: "sshContainer", config: "selected", daemon: "engine-a", container: id };
+  useRemote.setState({
+    session: {
+      target: { kind: "ssh", config: "selected" },
+      root: "/srv/app",
+      host: "Selected host",
+      os: "linux",
+      commands: [],
+    },
+  });
+  containers.mockResolvedValue({
+    status: "ok",
+    data: { daemon: "engine-a", containers: [{ id, name: "api-dev", image: "ubuntu:24.04", status: "Up" }] },
+  });
+  folders.mockResolvedValueOnce({
+    status: "ok",
+    data: { directory: "/workspaces/app", folders: ["src"], user: "dev" },
+  });
+  folders.mockResolvedValueOnce({ status: "ok", data: { directory: "/workspaces/app/src", folders: [], user: "dev" } });
+  openRemote.mockResolvedValue(true);
+  openConnectDialog("attach");
+  render(<ConnectHost />);
+  fireEvent.click(await screen.findByRole("button", { name: /api-dev/ }));
+  expect(containers).toHaveBeenCalledWith("selected", expect.any(Number));
+  fireEvent.click(screen.getByRole("button", { name: "Select Container" }));
+  fireEvent.click(await screen.findByRole("button", { name: "src" }));
+  await waitFor(() => expect(screen.getByLabelText("Container project directory")).toHaveValue("/workspaces/app/src"));
+  expect(folders).toHaveBeenCalledWith(target, null, expect.any(Number));
+  expect(folders).toHaveBeenCalledWith(target, "/workspaces/app/src", expect.any(Number));
+  fireEvent.click(screen.getByRole("button", { name: "Open Container Project" }));
+  await waitFor(() => expect(openRemote).toHaveBeenCalledWith(target, "/workspaces/app/src"));
+  expect(list).not.toHaveBeenCalled();
+});
+
+it("reopens a trusted SSH project with the selected host configuration file", async () => {
+  const root = "/srv/my project";
+  const file = ".devcontainer/compose/devcontainer.json";
+  useProject.setState({ project: { root, trusted: true } as never });
+  useRemote.setState({
+    session: { target: { kind: "ssh", config: "selected" }, root, host: "Selected host", os: "linux", commands: [] },
+  });
+  devConfigs.mockResolvedValue({ status: "ok", data: [".devcontainer/devcontainer.json", file] });
+  openRemote.mockResolvedValue(true);
+  openConnectDialog("reopen");
+  render(<ConnectHost />);
+  fireEvent.click(await screen.findByRole("button", { name: "Dev Container configuration" }));
+  fireEvent.click(screen.getByRole("option", { name: file }));
+  fireEvent.click(screen.getByRole("button", { name: "Reopen in Container" }));
+  await waitFor(() =>
+    expect(openRemote).toHaveBeenCalledWith({ kind: "sshDevContainer", config: "selected", folder: root, file }, root),
+  );
+  expect(devConfigs).toHaveBeenCalledWith(expect.any(Number));
+  expect(containers).not.toHaveBeenCalled();
 });

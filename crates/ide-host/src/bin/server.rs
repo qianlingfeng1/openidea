@@ -82,7 +82,7 @@ async fn run(base: PathBuf) -> i32 {
         sink_for: Box::new(move |window| rpc::event_sink(sink_peer.clone(), Some(window.to_owned()))),
         owner: |w| w,
         runtime: tokio::runtime::Handle::current(),
-        project_environment: true,
+        project_environment: std::env::var_os(ide_host::environment::SKIP_DEVCONTAINER_ENV).is_none(),
     }));
     // The desktop's code plugins run here, next to the project (`plugin_sync_packages`).
     let plugins = match RemotePlugins::start(&plugins_data, &host, peer.clone()) {

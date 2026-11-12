@@ -8,6 +8,8 @@ const BADGE: Record<RemoteSession["target"]["kind"], string> = {
   ssh: "SSH",
   wsl: "WSL",
   devContainer: "Dev Container",
+  sshContainer: "Container",
+  sshDevContainer: "Dev Container",
 };
 
 /** Status bar label of a remote window: where its project runs. */
