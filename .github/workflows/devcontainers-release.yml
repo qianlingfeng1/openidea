@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       hotfix_revision:
-        description: 'Hotfix revision. Leave empty to publish the latest upstream stable version.'
+        description: "Hotfix revision. Leave empty to publish the latest upstream stable version."
         required: false
         type: string
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: "3,13,23,33,43,53 * * * *"
 
 permissions:
   contents: read
@@ -141,8 +141,8 @@ jobs:
     env:
       OPENIDEA_SERVER_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download
       OPENIDEA_SERVER_RELEASE_TAG_PREFIX: devcontainers-v
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_LTO: "false"
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
