@@ -21,7 +21,13 @@ const SOCKET: &str = r#"if [ -n "${DOCKER_CONTEXT:-}" ]; then
 elif [ -n "${DOCKER_HOST:-}" ]; then
     printf '%s\n' "$DOCKER_HOST"
 else
-    docker context inspect --format '{{(index .Endpoints "docker").Host}}'
+    # Older Docker can return its top-level help for unknown commands.
+    help=$(docker --help) || exit "$?"
+    if printf '%s\n' "$help" | grep -Eq '^[[:blank:]]+context[[:blank:]]'; then
+        docker context inspect --format '{{(index .Endpoints "docker").Host}}'
+    else
+        printf '%s\n' 'unix:///var/run/docker.sock'
+    fi
 fi"#;
 
 #[derive(Serialize, Deserialize, Type)]
@@ -439,6 +445,27 @@ async fn output(session: &Session, command: &str, operation: &str) -> IdeResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn uses_default_socket_with_a_legacy_docker_cli() {
+        let docker = r#"docker() {
+    if [ "$1" = --help ] || [ "$2" = --help ]; then
+        printf '%s\n' 'Usage: docker [OPTIONS] COMMAND' '  container  Manage containers'
+    else
+        printf '%s\n' 'unknown flag: --format' >&2
+        return 125
+    fi
+}"#;
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("{docker}\n{SOCKET}")])
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_HOST")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"unix:///var/run/docker.sock\n");
+    }
 
     #[test]
     fn picks_the_deepest_bind_mount_at_a_path_boundary() {
