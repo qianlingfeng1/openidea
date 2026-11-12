@@ -8,7 +8,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 const QUICK: Duration = Duration::from_secs(25);
@@ -72,6 +75,64 @@ struct Mount {
     destination: String,
 }
 
+/// Keeps the validated selection while browsing, without keeping its SSH session alive.
+#[derive(Default)]
+pub struct ContainerBrowser {
+    selection: Mutex<Option<ContainerSelection>>,
+}
+
+#[derive(Clone)]
+struct ContainerSelection {
+    session: Weak<Session>,
+    daemon: String,
+    container: String,
+    socket: String,
+    user: String,
+}
+
+impl ContainerBrowser {
+    pub async fn folders(
+        &self,
+        session: Arc<Session>,
+        daemon: &str,
+        id: &str,
+        path: Option<&str>,
+        host_root: Option<&str>,
+    ) -> IdeResult<ContainerFolders> {
+        if let Some(path) = path {
+            let selection = self
+                .selection
+                .lock()
+                .as_ref()
+                .filter(|selection| {
+                    selection.session.as_ptr() == Arc::as_ptr(&session)
+                        && selection.daemon == daemon
+                        && selection.container == id
+                })
+                .cloned();
+            if let Some(selection) = selection {
+                let docker = DockerOverSsh { session, socket: selection.socket };
+                return docker.directory(id, path, &selection.user, true).await;
+            }
+        }
+
+        let (docker, daemon) = DockerOverSsh::connect(session, Some(daemon)).await?;
+        let info = docker.inspect(id).await?;
+        let folders = match path {
+            Some(path) => docker.directory(id, path, &info.user, true).await?,
+            None => docker.initial_folders(id, &info, host_root).await?,
+        };
+        *self.selection.lock() = Some(ContainerSelection {
+            session: Arc::downgrade(&docker.session),
+            daemon,
+            container: id.to_owned(),
+            socket: docker.socket,
+            user: info.user,
+        });
+        Ok(folders)
+    }
+}
+
 /// Pins the effective Docker socket for every command, including port forwards.
 #[derive(Clone)]
 pub struct DockerOverSsh {
@@ -80,7 +141,7 @@ pub struct DockerOverSsh {
 }
 
 impl DockerOverSsh {
-    pub async fn connect(session: Arc<Session>) -> IdeResult<(Self, String)> {
+    pub async fn connect(session: Arc<Session>, expected_daemon: Option<&str>) -> IdeResult<(Self, String)> {
         let command = format!(
             "printf '%s\\n' {MARKER}; command -v docker >/dev/null 2>&1 || {{ echo 'Docker CLI is not installed on the SSH host' >&2; exit 127; }}; {SOCKET}"
         );
@@ -97,6 +158,9 @@ impl DockerOverSsh {
         }
         if daemon.is_empty() || daemon.len() > 128 || daemon.chars().any(char::is_whitespace) {
             return Err(IdeError::unavailable("Docker did not report a daemon ID"));
+        }
+        if expected_daemon.is_some_and(|expected| expected != daemon) {
+            return Err(IdeError::unavailable("The SSH host's Docker daemon changed. Select the container again."));
         }
         Ok((docker, daemon.to_owned()))
     }
@@ -126,11 +190,12 @@ impl DockerOverSsh {
         Ok(info)
     }
 
-    pub async fn folders(&self, id: &str, path: Option<&str>, host_root: Option<&str>) -> IdeResult<ContainerFolders> {
-        let info = self.inspect(id).await?;
-        if let Some(path) = path {
-            return self.directory(id, path, &info.user, true).await;
-        }
+    async fn initial_folders(
+        &self,
+        id: &str,
+        info: &ContainerInfo,
+        host_root: Option<&str>,
+    ) -> IdeResult<ContainerFolders> {
         if let Some(mapped) = host_root.and_then(|root| mounted_path(root, info.mounts.as_deref().unwrap_or_default()))
             && let Ok(folders) = self.directory(id, &mapped, &info.user, true).await
         {
@@ -445,6 +510,69 @@ async fn output(session: &Session, command: &str, operation: &str) -> IdeResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn folder_navigation_reuses_only_the_validated_selection() {
+        use ide_core::remote_settings::SshAuth;
+        use ide_ssh::{ConnectError, SshFiles, SshTarget, testing::sshd};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = commands.clone();
+        let port = sshd(
+            tmp.path().to_owned(),
+            Arc::new(move |cmd| {
+                let (operation, result) = if cmd.contains("command -v docker") {
+                    ("socket", "unix:///var/run/docker.sock")
+                } else if cmd.contains(" info --format ") {
+                    ("info", "linux daemon")
+                } else if cmd.contains(" container inspect --format ") {
+                    ("inspect", r#"{"Name":"/dev","User":"dev","WorkingDir":"/work","Running":true,"Paused":false,"Restarting":false}"#)
+                } else if cmd.ends_with(" sh /work/src list") {
+                    ("list", "/work/src\0lib\0")
+                } else if cmd.ends_with(" sh /work list") {
+                    ("list", "/work\0src\0")
+                } else {
+                    panic!("unexpected SSH command: {cmd}");
+                };
+                recorded.lock().push(operation);
+                (format!("{MARKER}\n{result}"), 0)
+            }),
+        )
+        .await;
+        let files = SshFiles { known_hosts: tmp.path().join("known_hosts"), config: None };
+        let target = SshTarget {
+            host: "127.0.0.1".into(),
+            port: Some(port),
+            user: "dev".into(),
+            auth: SshAuth::Password,
+            key_file: String::new(),
+        };
+        let session = Arc::new(match Session::connect(&target, Some("secret"), &files).await {
+            Err(ConnectError::UnknownHostKey(key)) => {
+                key.trust(&files.known_hosts).unwrap();
+                Session::connect(&target, Some("secret"), &files).await.ok().unwrap()
+            }
+            result => result.ok().unwrap(),
+        });
+        let browser = ContainerBrowser::default();
+        let container = "a".repeat(64);
+
+        let first = browser.folders(session.clone(), "daemon", &container, None, None).await.unwrap();
+        assert_eq!(first.directory, "/work");
+        assert_eq!(first.folders, ["src"]);
+        let next = browser.folders(session, "daemon", &container, Some("/work/src"), None).await.unwrap();
+        assert_eq!(next.directory, "/work/src");
+        assert_eq!(next.folders, ["lib"]);
+        assert_eq!(next.user, "dev");
+        assert_eq!(commands.lock().as_slice(), ["socket", "info", "inspect", "list", "list"]);
+
+        let reconnected = Arc::new(Session::connect(&target, Some("secret"), &files).await.ok().unwrap());
+        browser.folders(reconnected.clone(), "daemon", &container, Some("/work/src"), None).await.unwrap();
+        assert_eq!(&commands.lock()[5..], ["socket", "info", "inspect", "list"]);
+        assert!(browser.folders(reconnected, "other-daemon", &container, Some("/work"), None).await.is_err());
+        assert_eq!(&commands.lock()[9..], ["socket", "info"]);
+    }
 
     #[cfg(unix)]
     #[test]

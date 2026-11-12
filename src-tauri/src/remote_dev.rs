@@ -8,7 +8,7 @@ use crate::state::AppState;
 use ide_core::{CancellationToken, EventSink, IdeError, IdeResult, RequestId};
 use ide_host::rpc::{ChannelMessage, EventMessage, Invoke, ServerInfo};
 use ide_jsonrpc::{Handler, NoopHandler, Peer};
-use ide_remote::ssh_container::{ContainerFolders, DockerOverSsh, SshContainers};
+use ide_remote::ssh_container::{ContainerBrowser, ContainerFolders, DockerOverSsh, SshContainers};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,11 +73,7 @@ impl Drop for RemoteRequest<'_> {
 }
 
 async fn ssh_docker(state: &AppState, config: &str, expected: Option<&str>) -> IdeResult<(DockerOverSsh, String)> {
-    let (docker, daemon) = DockerOverSsh::connect(state.ssh.session(config).await?).await?;
-    if expected.is_some_and(|id| id != daemon) {
-        return Err(IdeError::unavailable("The SSH host's Docker daemon changed. Select the container again."));
-    }
-    Ok((docker, daemon))
+    DockerOverSsh::connect(state.ssh.session(config).await?, expected).await
 }
 
 #[tauri::command]
@@ -88,6 +84,7 @@ pub async fn remote_container_list(
     config: String,
     request: RequestId,
 ) -> IdeResult<SshContainers> {
+    state.remote_dev.container_browsers.lock().remove(AppState::owner_window(window.label()));
     RemoteRequest::new(&state, window.label(), request)
         .run(async {
             let (docker, daemon) = ssh_docker(&state, &config, None).await?;
@@ -108,15 +105,17 @@ pub async fn remote_container_folders(
     let RemoteTarget::SshContainer { config, daemon, container } = target else {
         return Err(IdeError::invalid("Expected an SSH container target"));
     };
-    let host_project = state.remote_dev.get(AppState::owner_window(window.label()));
+    let owner = AppState::owner_window(window.label());
+    let host_project = state.remote_dev.get(owner);
     let host_root = host_project.as_ref().and_then(|c| match &c.target {
         RemoteTarget::Ssh { config: id } if id == &config => Some(c.root.as_str()),
         _ => None,
     });
     RemoteRequest::new(&state, window.label(), request)
         .run(async {
-            let (docker, _) = ssh_docker(&state, &config, Some(&daemon)).await?;
-            docker.folders(&container, path.as_deref(), host_root).await
+            let browser = state.remote_dev.container_browser(owner);
+            let session = state.ssh.session(&config).await?;
+            browser.folders(session, &daemon, &container, path.as_deref(), host_root).await
         })
         .await
 }
@@ -196,10 +195,11 @@ impl Forward {
 type Channels = Arc<Mutex<HashMap<u64, (Channel<ChannelFrame>, u64)>>>;
 
 #[derive(Default)]
-pub struct Connections(
-    Mutex<HashMap<String, Arc<Connection>>>,
-    Mutex<HashMap<RemoteTarget, Weak<tokio::sync::Mutex<()>>>>,
-);
+pub struct Connections {
+    projects: Mutex<HashMap<String, Arc<Connection>>>,
+    provisioning: Mutex<HashMap<RemoteTarget, Weak<tokio::sync::Mutex<()>>>>,
+    container_browsers: Mutex<HashMap<String, Arc<ContainerBrowser>>>,
+}
 
 impl Connection {
     pub async fn authorize_command(&self, window: &str, command: &str) -> IdeResult<()> {
@@ -226,7 +226,7 @@ impl Connection {
 impl Connections {
     /// Serializes CLI provisioning of the same project and configuration across windows.
     fn provisioning(&self, target: &RemoteTarget) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.1.lock();
+        let mut locks = self.provisioning.lock();
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
             return lock;
@@ -237,13 +237,17 @@ impl Connections {
     }
 
     pub fn get(&self, window: &str) -> Option<Arc<Connection>> {
-        self.0.lock().get(window).cloned()
+        self.projects.lock().get(window).cloned()
+    }
+
+    fn container_browser(&self, window: &str) -> Arc<ContainerBrowser> {
+        self.container_browsers.lock().entry(window.to_owned()).or_default().clone()
     }
 
     /// The window connected to folder `root` of `target`.
     pub fn window_of(&self, target: &RemoteTarget, root: &str) -> Option<String> {
         let root = root.trim_end_matches('/');
-        self.0
+        self.projects
             .lock()
             .iter()
             // A dev container is one project: its folder there is only known once connected.
@@ -258,11 +262,12 @@ impl Connections {
 
     /// Every connected window.
     pub fn all(&self) -> Vec<(String, Arc<Connection>)> {
-        self.0.lock().iter().map(|(w, c)| (w.clone(), c.clone())).collect()
+        self.projects.lock().iter().map(|(w, c)| (w.clone(), c.clone())).collect()
     }
 
     pub fn disconnect(&self, window: &str) {
-        if let Some(c) = self.0.lock().remove(window) {
+        self.container_browsers.lock().remove(window);
+        if let Some(c) = self.projects.lock().remove(window) {
             c.peer.kill();
             c.forwards.lock().clear();
         }
@@ -685,7 +690,7 @@ pub async fn remote_connect(
                     "The selected devcontainer configuration was not found on the SSH host",
                 ));
             }
-            let (docker, _) = request.run(DockerOverSsh::connect(session)).await?;
+            let (docker, _) = request.run(DockerOverSsh::connect(session, None)).await?;
             let (peer, root, run, ports) =
                 crate::remote_container::reopen_ssh(&state, docker, (&root, file), handler, &request, &progress)
                     .await?;
@@ -760,7 +765,7 @@ pub async fn remote_connect(
     state.remote_dev.disconnect(&label);
     state.host.close_project(&label);
     state.host.mcp_reports.set_remote(&label, std::path::PathBuf::from(&connection.root));
-    state.remote_dev.0.lock().insert(label.clone(), connection.clone());
+    state.remote_dev.projects.lock().insert(label.clone(), connection.clone());
     let weak = Arc::downgrade(&connection);
     let peer = connection.peer.clone();
     let auth_plugins = state.plugins.clone();
