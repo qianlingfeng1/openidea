@@ -9,13 +9,15 @@ use ide_tools::jdk::{JdkReleases, JdkVendor};
 use ide_tools::{InstallEvent, ToolInfo, Tools};
 use std::path::PathBuf;
 
-/// The installer, reporting the executables chosen in the window's settings.
-fn tools(host: &Host, window: &str) -> IdeResult<Tools> {
-    host.require_trust(window)?;
+/// Tool paths and language definitions from the same trusted settings.
+fn tools(host: &Host, project: Option<&crate::Project>) -> IdeResult<(Tools, Vec<ide_language::LanguageConfig>)> {
     let data = host.local_data_dir.clone();
-    let (settings, root) = match host.project(window) {
-        Ok(project) => (project.settings.effective(), project.root.clone()),
-        Err(_) => (host.global_settings.effective(), Default::default()),
+    let (settings, root) = match project {
+        Some(project) => {
+            project.require_trust()?;
+            (project.settings.effective(), project.root.clone())
+        }
+        None => (host.global_settings.effective(), Default::default()),
     };
     let custom = settings
         .tools
@@ -26,22 +28,14 @@ fn tools(host: &Host, window: &str) -> IdeResult<Tools> {
     let found = ide_sdk::godot::find(None).map(|p| (ide_sdk::godot::COMMAND.to_owned(), p));
     let runtime = ide_sdk::apply::tool_install_environment(&root, &settings);
     let work_dir = (!root.as_os_str().is_empty()).then_some(root);
-    Ok(Tools::new(&data)
+    let tools = Tools::new(&data)
         .with_runtime(runtime.commands, runtime.env)
         .with_custom_paths(custom)
         .with_found_paths(found.into_iter().collect())
-        .with_work_dir(work_dir))
-}
-
-/// The language definitions plus the servers defined in the window's settings.
-fn languages(host: &Host, window: &str) -> Vec<ide_language::LanguageConfig> {
-    let settings = match host.project(window) {
-        Ok(project) => project.settings.effective(),
-        Err(_) => host.global_settings.effective(),
-    };
+        .with_work_dir(work_dir);
     let mut langs = host.languages.all();
     ide_sdk::apply::with_custom_servers(&mut langs, &settings);
-    langs
+    Ok((tools, langs))
 }
 
 fn join_err(e: impl std::fmt::Display) -> IdeError {
@@ -57,8 +51,8 @@ fn reconfigure_servers(host: &Host) {
 
 /// Status of every known language server / debug adapter and the languages using it.
 pub async fn tools_list(host: &Host, window: &str) -> IdeResult<Vec<ToolInfo>> {
-    let tools = tools(host, window)?;
-    let langs = languages(host, window);
+    let project = host.project(window).ok();
+    let (tools, langs) = tools(host, project.as_deref())?;
     tokio::task::spawn_blocking(move || tools.list(&langs)).await.map_err(join_err)
 }
 
@@ -71,8 +65,8 @@ pub async fn tools_install(
     request: RequestId,
     on_event: Channel<InstallEvent>,
 ) -> IdeResult<ToolInfo> {
-    let tools = tools(host, window)?;
-    let langs = languages(host, window);
+    let project = host.project(window)?;
+    let (tools, langs) = tools(host, Some(&project))?;
     let cancel = host.begin_request(request);
     let result = tokio::task::spawn_blocking(move || {
         tools.install(&name, &langs, &cancel, &|e| {
@@ -91,8 +85,8 @@ pub async fn tools_install(
 
 /// Removes a tool the IDE installed.
 pub async fn tools_uninstall(host: &Host, window: &str, name: String) -> IdeResult<ToolInfo> {
-    let tools = tools(host, window)?;
-    let langs = languages(host, window);
+    let project = host.project(window)?;
+    let (tools, langs) = tools(host, Some(&project))?;
     let info = tokio::task::spawn_blocking(move || tools.uninstall(&name, &langs)).await.map_err(join_err)??;
     reconfigure_servers(host);
     Ok(info)

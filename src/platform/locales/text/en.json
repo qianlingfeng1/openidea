@@ -1,4 +1,5 @@
 {
+  "Could not sync language servers": "Could not sync language servers",
   "Connect to Running Container…": "Connect to Running Container…",
   "Build or start this project's development container on the SSH host.": "Build or start this project's development container on the SSH host.",
   "Dev Container configuration": "Dev Container configuration",

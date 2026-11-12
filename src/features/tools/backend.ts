@@ -5,6 +5,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import type { InstallEvent, RequestId, ToolInfo } from "@/bindings";
 import { call, commands, IpcError, isTauri } from "@/platform/ipc";
+import { invokeLocal } from "@/platform/tauriCore";
 
 export interface LanguageChoice {
   id: string;
@@ -45,6 +46,10 @@ export const tauriToolsBackend: ToolsBackend = {
   languages: async () =>
     (await commands.languages()).map((l) => ({ id: l.id, name: l.name })).sort((a, b) => a.name.localeCompare(b.name)),
 };
+
+export function listLocalTools(): Promise<ToolInfo[]> {
+  return invokeLocal<ToolInfo[]>("tools_list");
+}
 
 function tool(partial: Partial<ToolInfo> & Pick<ToolInfo, "name" | "languages">): ToolInfo {
   return {

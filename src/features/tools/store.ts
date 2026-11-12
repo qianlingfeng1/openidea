@@ -4,7 +4,7 @@ import type { RequestId, ToolInfo } from "@/bindings";
 import { executeAction } from "@/platform/actions";
 import { isCancelled, nextRequestId } from "@/platform/ipc";
 import { notifications } from "@/workbench/contributions";
-import { cancelTask, queueTask, upsertTask, useTasks } from "@/workbench/tasks";
+import { cancelTask, queuedCancelled, queueTask, upsertTask, useTasks } from "@/workbench/tasks";
 import { toolsBackend } from "./backend";
 import { tx } from "@/platform/i18n";
 
@@ -94,9 +94,14 @@ export function toolByName(name: string): ToolInfo | undefined {
  * failure / cancellation (already reported). Restarts language servers of that
  * name afterwards so open files get code insight right away.
  */
-export function installTool(name: string, opts: { notificationKey?: string } = {}): Promise<ToolInfo | null> {
+export function installTool(
+  name: string,
+  opts: { notificationKey?: string; onlyIfMissing?: boolean; signal?: AbortSignal } = {},
+): Promise<ToolInfo | null> {
+  const { signal, onlyIfMissing } = opts;
+  if (signal?.aborted) return Promise.resolve(null);
   const existing = running.get(name);
-  if (existing) return existing;
+  if (existing) return onlyIfMissing ? existing.then(() => installTool(name, opts)) : existing;
   const display = toolByName(name)?.displayName ?? name;
   const request = nextRequestId();
   const taskId = `tools:${name}`;
@@ -106,13 +111,23 @@ export function installTool(name: string, opts: { notificationKey?: string } = {
   const cancel = () => toolsBackend().cancel(request);
   const task = (message: string | null, fraction: number | null) =>
     upsertTask({ id: taskId, title, message, fraction, done: false, cancel });
+  const abort = () => cancelTask(taskId);
+  signal?.addEventListener("abort", abort, { once: true });
 
   const p = (async () => {
     try {
       // Downloads and package managers run one at a time; the rest wait, cancellable.
-      const info = await queueTask(DOWNLOAD_QUEUE, { id: taskId, title }, () => {
+      const info = await queueTask(DOWNLOAD_QUEUE, { id: taskId, title }, async () => {
+        if (signal?.aborted) throw queuedCancelled();
         task(null, null);
+        if (onlyIfMissing) {
+          // Another install in the queue may have supplied this tool as part of a shared package.
+          const tool = (await toolsBackend().list()).find((entry) => entry.name === name);
+          if (signal?.aborted) throw queuedCancelled();
+          if (tool?.status !== "missing" || !tool.canInstall) return null;
+        }
         return toolsBackend().install(name, request, (e) => {
+          if (signal?.aborted) return;
           if (e.type === "line") {
             patchJob(name, (j) => ({ ...j, lines: [...j.lines, e.text].slice(-MAX_LOG_LINES), message: e.text }));
             task(e.text, null);
@@ -122,6 +137,11 @@ export function installTool(name: string, opts: { notificationKey?: string } = {
           }
         });
       });
+      if (signal?.aborted) throw queuedCancelled();
+      if (!info) {
+        endJob(name, null);
+        return null;
+      }
       upsertTool(info);
       endJob(name, null);
       void toolsBackend()
@@ -138,7 +158,7 @@ export function installTool(name: string, opts: { notificationKey?: string } = {
       void refreshTools();
       return info;
     } catch (e) {
-      if (isCancelled(e)) {
+      if (signal?.aborted || isCancelled(e)) {
         endJob(name, "Cancelled");
         return null;
       }
@@ -154,6 +174,7 @@ export function installTool(name: string, opts: { notificationKey?: string } = {
       });
       return null;
     } finally {
+      signal?.removeEventListener("abort", abort);
       upsertTask({ id: taskId, title, message: null, fraction: 1, done: true });
       running.delete(name);
     }

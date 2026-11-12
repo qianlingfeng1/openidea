@@ -1,4 +1,5 @@
 {
+  "Could not sync language servers": "无法同步语言服务器",
   "Connect to Running Container…": "连接运行中的容器…",
   "Build or start this project's development container on the SSH host.": "在 SSH 主机上构建或启动此项目的开发容器。",
   "Dev Container configuration": "开发容器配置",
